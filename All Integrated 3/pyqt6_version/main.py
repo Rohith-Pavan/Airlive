@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from PyQt6 import uic, QtGui
 from PyQt6.QtWidgets import QApplication, QLabel, QWidget
-from PyQt6.QtCore import Qt, QSize
+from PyQt6.QtCore import Qt, QSize, QTimer, QDateTime
 from PyQt6.QtMultimedia import QCamera, QMediaCaptureSession, QMediaPlayer, QAudioOutput, QVideoSink, QVideoFrame
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 from video_source_dialog import VideoSourceDialog
@@ -17,6 +17,7 @@ from effects_manager import EffectsManager
 from graphics_output_widget import GraphicsOutputManager, preanalyze_effects_folder
 from gstreamer.gst_stream_manager import NewStreamManager, NewStreamControlWidget
 from gstreamer.audio_compositor import AudioCompositor
+from gstreamer.recording_manager import RecordingManager
 
 
 
@@ -813,10 +814,17 @@ def main():
 
     # --- Apply Icons ---
     icon_path = Path(__file__).resolve().parent / "icons"
-    window.settingsTopButton.setIcon(QtGui.QIcon(str(icon_path / "Settings.png")))
-    window.audioTopButton.setIcon(QtGui.QIcon(str(icon_path / "Volume.png")))
-    window.recordRedCircle.setIcon(QtGui.QIcon(str(icon_path / "Record.png")))
-    window.playButton.setIcon(QtGui.QIcon(str(icon_path / "Play.png")))
+    if hasattr(window, 'audioTopButton') and window.audioTopButton:
+        window.audioTopButton.setIcon(QtGui.QIcon(str(icon_path / "Volume.png")))
+    # Record panel icons
+    if hasattr(window, 'settingsRecordButton') and window.settingsRecordButton:
+        window.settingsRecordButton.setIcon(QtGui.QIcon(str(icon_path / "Settings.png")))
+    if hasattr(window, 'recordRedCircle') and window.recordRedCircle:
+        window.recordRedCircle.setIcon(QtGui.QIcon(str(icon_path / "Record.png")))
+    if hasattr(window, 'playButton') and window.playButton:
+        window.playButton.setIcon(QtGui.QIcon(str(icon_path / "Play.png")))
+    if hasattr(window, 'captureButton') and window.captureButton:
+        window.captureButton.setIcon(QtGui.QIcon(str(icon_path / "capture.png")))
     window.stream1SettingsBtn.setIcon(QtGui.QIcon(str(icon_path / "Settings.png")))
     window.stream1AudioBtn.setIcon(QtGui.QIcon(str(icon_path / "Stream.png")))
     window.stream2SettingsBtn.setIcon(QtGui.QIcon(str(icon_path / "Settings.png")))
@@ -860,14 +868,14 @@ def main():
     audio_compositor.start()
 
     # Initialize video input manager
-    video_manager = VideoInputManager(window)
+    video_input_manager = VideoInputManager(window)
     # Provide audio compositor to video manager for mute hooks
-    video_manager.audio_compositor = audio_compositor
+    video_input_manager.audio_compositor = audio_compositor
     
     # Connect video manager to graphics widget's video item
     video_item = graphics_manager.get_video_item_for_output("main_output")
     if video_item:
-        video_manager.output_preview_widget = video_item
+        video_input_manager.output_preview_widget = video_item
         print("Video manager connected to graphics video item")
     else:
         print("Warning: Could not connect video manager to graphics video item")
@@ -924,28 +932,245 @@ def main():
 
     # Setup cleanup on application exit
     def cleanup_on_exit():
-        print("Application shutting down, cleaning up resources...")
+        """Ensure all resources are released when the app closes."""
+        print("Cleaning up resources...")
         try:
-            # Stop all streams first
+            # Stop all streams
             stream_manager.stop_all_streams()
-            
-            # Clean up video resources
-            video_manager.cleanup_resources()
-            
+
+            # Stop recording
+            recording_manager.stop_recording()
+
+            # Cleanup video inputs
+            video_input_manager.cleanup_resources()
+
             # Clear graphics effects
             graphics_manager.clear_all_frames()
 
             # Stop audio compositor
-            try:
-                audio_compositor.stop()
-            except Exception:
-                pass
+            audio_compositor.stop()
 
             print("Cleanup completed successfully")
         except Exception as e:
             print(f"Error during cleanup: {e}")
-    
     app.aboutToQuit.connect(cleanup_on_exit)
+
+    # Recording Manager Setup
+    ac_channel = audio_compositor.channel_name
+    recording_manager = RecordingManager(audio_channel=ac_channel)
+    recording_manager.register_graphics_view(graphics_manager.get_output_widget("main_output"))
+
+    # --- Record Panel UI State & Logic ---
+    # Elements
+    record_btn = getattr(window, 'recordRedCircle', None)
+    pause_btn = getattr(window, 'playButton', None)
+    screenshot_btn = getattr(window, 'captureButton', None)
+    status_icon = getattr(window, 'recordStatusIcon', None)
+    status_text = getattr(window, 'recordStatusText', None)
+    settings_btn = getattr(window, 'settingsRecordButton', None)
+
+    # Access graphics output widget for screenshots
+    graphics_widget = graphics_manager.get_output_widget("main_output")
+
+    # Initial state
+    state = {
+        'is_recording': False, # True when recording or paused
+        'is_paused': False,
+        'elapsed': 0,
+        'blink_on': False
+    }
+
+    # Default recording settings
+    try:
+        from PyQt6.QtCore import QStandardPaths
+        videos_path = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.MoviesLocation)
+        default_rec_path = Path(videos_path) / "GoLive_Recording.mp4"
+        rec_settings = {
+            'resolution': '1280x720',
+            'fps': 30,
+            'video_bitrate': 4000, # kbps
+            'audio_bitrate': 128, # kbps
+            'output_path': str(default_rec_path)
+        }
+        recording_manager.configure_recording(rec_settings)
+    except Exception as e:
+        print(f"[Main] Error setting default recording config: {e}")
+
+    # Timers
+    elapsed_timer = QTimer(window)
+    elapsed_timer.setInterval(1000)
+    blink_timer = QTimer(window)
+    blink_timer.setInterval(500)
+
+    def _format_time(sec: int) -> str:
+        h = sec // 3600
+        m = (sec % 3600) // 60
+        s = sec % 60
+        if h:
+            return f"{h:02d}:{m:02d}:{s:02d}"
+        return f"{m:02d}:{s:02d}"
+
+    def _set_status_ready():
+        if status_icon:
+            status_icon.setStyleSheet("background-color: #777777; border-radius: 6px;")
+        if status_text:
+            status_text.setText("Ready")
+
+    def _set_status_recording():
+        # blinking red dot
+        if status_icon:
+            color = "#ff3b30" if state['blink_on'] else "#551111"
+            status_icon.setStyleSheet(f"background-color: {color}; border-radius: 6px;")
+        if status_text:
+            status_text.setText(f"REC {_format_time(state['elapsed'])}")
+
+    def _set_status_paused():
+        if status_icon:
+            status_icon.setStyleSheet("background-color: #ffcc00; border-radius: 2px;")
+        if status_text:
+            status_text.setText(f"Paused {_format_time(state['elapsed'])}")
+
+    def _set_status_saving():
+        if status_icon:
+            status_icon.setStyleSheet("background-color: #888888; border-radius: 6px;")
+        if status_text:
+            status_text.setText("Saving…")
+
+    def _set_status_stopped():
+        if status_icon:
+            status_icon.setStyleSheet("background-color: #777777; border-radius: 6px;")
+        if status_text:
+            status_text.setText("Ready")
+
+    def _on_elapsed_tick():
+        state['elapsed'] += 1
+        if state['is_recording'] and not state['is_paused']:
+            _set_status_recording()
+
+    def _on_blink_tick():
+        state['blink_on'] = not state['blink_on']
+        if state['is_recording'] and not state['is_paused']:
+            _set_status_recording()
+
+    elapsed_timer.timeout.connect(_on_elapsed_tick)
+    blink_timer.timeout.connect(_on_blink_tick)
+
+    def start_recording():
+        if recording_manager.start_recording():
+            print("[Main] Recording started via manager.")
+        else:
+            print("[Main] Failed to start recording via manager.")
+
+    def stop_recording():
+        recording_manager.stop_recording()
+        print("[Main] Recording stopped via manager.")
+
+    def on_record_button_clicked():
+        try:
+            if recording_manager.is_recording():
+                stop_recording()
+            else:
+                start_recording()
+        except Exception as e:
+            print(f"Record toggle error: {e}")
+
+    def on_play_pause_button_clicked():
+        # TODO: Implement pause/resume in RecordingManager
+        print("Pause/Resume is not yet implemented.")
+        # This is placeholder UI logic until the backend is ready
+        if not state['is_recording']:
+            return
+
+        state['is_paused'] = not state['is_paused']
+        if state['is_paused']:
+            elapsed_timer.stop()
+            blink_timer.stop()
+            _set_status_paused()
+        else:
+            elapsed_timer.start()
+            blink_timer.start()
+            _set_status_recording(is_resuming=True)
+
+    def on_screenshot_clicked():
+        try:
+            if not graphics_widget:
+                print("No graphics widget available for screenshot")
+                return
+            pixmap = graphics_widget.grab()
+            if pixmap.isNull():
+                print("Failed to grab screenshot")
+                return
+            ts = QDateTime.currentDateTime().toString("yyyyMMdd_HHmmss")
+            # Use QStandardPaths for a more robust pictures location
+            from PyQt6.QtCore import QStandardPaths
+            pictures_path = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.PicturesLocation)
+            out_dir = Path(pictures_path)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = out_dir / f"golive_shot_{ts}.png"
+            ok = pixmap.save(str(out_path))
+            print(f"Screenshot {'saved to' if ok else 'failed saving to'} {out_path}")
+        except Exception as e:
+            print(f"Screenshot error: {e}")
+
+    # Initialize default states
+    if status_text and status_icon:
+        _set_status_ready()
+    if pause_btn:
+        pause_btn.setEnabled(False)
+        try:
+            pause_btn.setChecked(False)
+        except Exception:
+            pass
+
+    # Hook up buttons
+    if record_btn:
+        record_btn.setCheckable(True)
+        record_btn.setChecked(False)
+        record_btn.clicked.connect(on_record_button_clicked)
+    if pause_btn:
+        pause_btn.setEnabled(False) # Disabled by default
+        pause_btn.clicked.connect(on_play_pause_button_clicked)
+    if screenshot_btn:
+        screenshot_btn.clicked.connect(on_screenshot_clicked)
+
+    # Connect recording manager signals to UI update functions
+    def on_recording_started():
+        state['is_recording'] = True
+        state['is_paused'] = False
+        state['elapsed'] = 0
+        elapsed_timer.start(1000)
+        blink_timer.start(500)
+        _set_status_recording()
+        if record_btn:
+            record_btn.setChecked(True)
+        if pause_btn:
+            pause_btn.setEnabled(True)
+
+    def on_recording_stopped():
+        state['is_recording'] = False
+        state['is_paused'] = False
+        elapsed_timer.stop()
+        blink_timer.stop()
+        _set_status_stopped()
+        if record_btn:
+            record_btn.setChecked(False)
+        if pause_btn:
+            pause_btn.setEnabled(False)
+            pause_btn.setChecked(False)
+
+    def on_recording_error(error_msg):
+        print(f"[REC ERROR] {error_msg}")
+        on_recording_stopped() # Visually stop on error
+        # Optionally, show a message box to the user
+        try:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.critical(window, "Recording Error", error_msg)
+        except Exception as e:
+            print(f"Could not show error dialog: {e}")
+
+    recording_manager.recording_started.connect(on_recording_started)
+    recording_manager.recording_stopped.connect(on_recording_stopped)
+    recording_manager.recording_error.connect(on_recording_error)
 
     window.show()
     return app.exec()
