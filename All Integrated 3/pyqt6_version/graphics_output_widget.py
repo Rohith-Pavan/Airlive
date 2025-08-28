@@ -6,7 +6,7 @@ Uses QGraphicsScene + QGraphicsView for compositing video and PNG effects
 
 import os
 from pathlib import Path
-from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QWidget, QVBoxLayout, QGraphicsPixmapItem
+from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QWidget, QVBoxLayout, QGraphicsPixmapItem, QSizePolicy
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QRectF
 from PyQt6.QtGui import QPixmap, QPainter, QBrush, QColor
 from PyQt6.QtMultimedia import QMediaPlayer, QCamera, QMediaCaptureSession
@@ -174,6 +174,8 @@ class GraphicsOutputWidget(QGraphicsView):
     
     def __init__(self, parent=None):
         super().__init__(parent)
+        # Ensure this view expands to fill its parent layout/container
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         
         # Create graphics scene (avoid shadowing QGraphicsView.scene())
         self.scene_obj = QGraphicsScene()

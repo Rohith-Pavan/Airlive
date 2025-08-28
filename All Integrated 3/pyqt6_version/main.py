@@ -9,7 +9,7 @@ from pathlib import Path
 from PyQt6 import uic, QtGui
 from PyQt6.QtWidgets import QApplication, QLabel, QWidget
 from PyQt6.QtCore import Qt, QSize
-from PyQt6.QtMultimedia import QCamera, QMediaCaptureSession, QMediaPlayer, QAudioOutput
+from PyQt6.QtMultimedia import QCamera, QMediaCaptureSession, QMediaPlayer, QAudioOutput, QVideoSink, QVideoFrame
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 from video_source_dialog import VideoSourceDialog
 from media_file_dialog import MediaFileDialog
@@ -69,6 +69,8 @@ class VideoInputManager:
         # Output preview management
         self.current_output_source = None
         self.output_preview_widget = None  # Will be set to composite widget's internal video widget
+        # Shared QVideoSink for routing camera frames into the graphics scene
+        self._qvideosink = None
         
         # --- Audio mute state ---
         self.muted_inputs = {
@@ -103,6 +105,13 @@ class VideoInputManager:
         # setup_output_preview() is now handled in main function with graphics widget
         self.connect_buttons()
         self.connect_audio_buttons()
+        # Initialize QVideoSink if available and connect frame signal
+        try:
+            self._qvideosink = QVideoSink()
+            # Forward frames from sink to the graphics video item as QImage
+            self._qvideosink.videoFrameChanged.connect(self._on_sink_frame)
+        except Exception as e:
+            print(f"Warning: QVideoSink not available or failed to initialize: {e}")
         
     def setup_input_widgets(self):
         """Setup video widgets for each input"""
@@ -629,25 +638,36 @@ class VideoInputManager:
                 if source_name in self.input_cameras and self.input_cameras[source_name]:
                     camera = self.input_cameras[source_name]
                     session = self.input_sessions[source_name]
-                    
+
                     if not session or not self.output_preview_widget:
                         print(f"Error: Invalid session or output widget for {source_name}")
                         return
-                    
-                    # Set camera output to main preview
-                    session.setVideoOutput(self.output_preview_widget)
-                    
+
+                    # Route camera frames to QVideoSink, which will feed the graphics item
+                    if self._qvideosink is not None:
+                        session.setVideoOutput(self._qvideosink)
+                    else:
+                        print("Error: QVideoSink unavailable; cannot display camera on output")
+                        return
+
                     # Ensure camera is running
                     if not camera.isActive():
                         camera.start()
-                    
+
                     self.current_output_source = (source_type, source_name)
                     print(f"Switched output to {source_name} camera")
+                    # Ensure graphics item in 'external frame' mode
+                    try:
+                        if hasattr(self.output_preview_widget, 'set_qimage_frame'):
+                            # No immediate frame yet; handler will provide
+                            pass
+                    except Exception:
+                        pass
                     # Update audio routing: enable only this input's mic; disable others and all media audio
                     self._apply_audio_for_active_source('input', source_name)
                 else:
                     print(f"No camera assigned to {source_name}. Please select a camera first.")
-                    
+
             elif source_type == 'media':
                 # Switch media file to output
                 if source_name in self.media_players and self.media_players[source_name]:
@@ -667,113 +687,55 @@ class VideoInputManager:
 
                     self.current_output_source = (source_type, source_name)
                     print(f"Switched output to {source_name} media")
+                    # Ensure graphics item uses its internal video rendering (clear any external qimage)
+                    try:
+                        if hasattr(self.output_preview_widget, 'set_qimage_frame'):
+                            self.output_preview_widget.set_qimage_frame(None)
+                    except Exception:
+                        pass
                     # Update audio routing: enable only this media's audio in AudioCompositor; disable all mics and other media
                     self._apply_audio_for_active_source('media', source_name)
                 else:
                     print(f"No media file assigned to {source_name}. Please select a media file first.")
-                    
+
         except Exception as e:
             print(f"Error switching to {source_type} {source_name}: {e}")
 
-    def _apply_audio_for_active_source(self, source_type: str, source_name: str):
-        """Ensure only the active source has audible audio.
-        - If active is input: activate that input's mic via AudioCompositor, mute/remove others; mute all media players.
-        - If active is media: mute/disable all mics; unmute only the active media source inside AudioCompositor; mute other media sources.
-        """
-        try:
-            # Handle inputs (mics) via AudioCompositor
-            ac = getattr(self, 'audio_compositor', None)
-            input_names = ('input1', 'input2', 'input3')
-            media_names = ('media1', 'media2', 'media3')
-
-            if ac:
-                if source_type == 'input':
-                    # Inputs: ensure only the selected mic is present and audible; remove all media sources entirely
-                    for name in input_names:
-                        if name == source_name:
-                            try:
-                                ac.add_auto_source(name)
-                            except Exception:
-                                pass
-                            vol = 0.0 if self.muted_inputs.get(name, False) or self.master_muted else 1.0
-                            ac.set_input_volume(name, vol)
-                        else:
-                            # Keep other inputs at 0 volume (or they may not exist yet)
-                            ac.set_input_volume(name, 0.0)
-                    # Remove all media sources to guarantee silence
-                    for m in media_names:
-                        try:
-                            if m in self._ac_present_sources:
-                                ac.remove_source(m)
-                                self._ac_present_sources.discard(m)
-                        except Exception:
-                            pass
-                else:
-                    # Media active: remove all mic inputs from mix, and keep only the active media in the pipeline
-                    for name in input_names:
-                        try:
-                            # Keep mics at 0 volume (or remove in future if added as sources)
-                            ac.set_input_volume(name, 0.0)
-                        except Exception:
-                            pass
-                    for m in media_names:
-                        if m == source_name and self.media_files.get(m):
-                            try:
-                                # Re-add/ensure only the active media exists in the mixer
-                                if m not in self._ac_present_sources:
-                                    ac.add_media_file_source(m, self.media_files[m])
-                                    self._ac_present_sources.add(m)
-                            except Exception:
-                                pass
-                            vol = 0.0 if self.muted_inputs.get(m, False) or self.master_muted else 1.0
-                            ac.set_input_volume(m, vol)
-                        else:
-                            try:
-                                if m in self._ac_present_sources:
-                                    ac.remove_source(m)
-                                    self._ac_present_sources.discard(m)
-                            except Exception:
-                                pass
-        except Exception as e:
-            print(f"Error applying audio state for active source {source_type}:{source_name}: {e}")
-
-    def _ensure_media_audio_output(self, media_name: str):
-        """Create and attach QAudioOutput for a media player if missing."""
-        try:
-            if media_name not in self.media_players:
-                return
-            player = self.media_players.get(media_name)
-            if not player:
-                return
-            if self.media_audio_outputs.get(media_name) is None:
-                ao = QAudioOutput()
-                try:
-                    ao.setVolume(1.0)
-                except Exception:
-                    pass
-                self.media_audio_outputs[media_name] = ao
-                try:
-                    player.setAudioOutput(ao)
-                except Exception:
-                    pass
-        except Exception as e:
-            print(f"Error creating audio output for {media_name}: {e}")
-    
     def _clear_current_output(self):
         """Clear current output connections to prevent conflicts"""
         try:
             # Clear all camera sessions from output
             for session in self.input_sessions.values():
-                if session and hasattr(session, 'videoOutput') and session.videoOutput() == self.output_preview_widget:
-                    session.setVideoOutput(None)
-            
+                if session and hasattr(session, 'videoOutput'):
+                    vo = session.videoOutput()
+                    if vo is not None and (vo == self.output_preview_widget or vo == self._qvideosink):
+                        session.setVideoOutput(None)
+
             # Clear all media players from output
             for player in self.media_players.values():
                 if player and hasattr(player, 'videoOutput') and player.videoOutput() == self.output_preview_widget:
                     player.setVideoOutput(None)
         except Exception as e:
             print(f"Error clearing output connections: {e}")
-    
+
+    def _on_sink_frame(self, frame: QVideoFrame):
+        """Handle frames from QVideoSink and forward to graphics video item as QImage."""
+        try:
+            if not self.output_preview_widget:
+                return
+            # Convert frame to QImage (Qt 6 provides toImage())
+            try:
+                img = frame.toImage()
+            except Exception as e:
+                print(f"Failed to convert QVideoFrame to QImage: {e}")
+                return
+            if img is None or img.isNull():
+                return
+            if hasattr(self.output_preview_widget, 'set_qimage_frame'):
+                self.output_preview_widget.set_qimage_frame(img)
+        except Exception as e:
+            print(f"Error handling sink frame: {e}")
+
     def cleanup_resources(self):
         """Clean up all resources to prevent memory leaks"""
         try:
