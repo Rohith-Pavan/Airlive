@@ -1,0 +1,14 @@
+{
+  "platform": "YouTube Live",
+  "url": "rtmp://a.rtmp.youtube.com/live2",
+  "key": "fmeb-a07u-why3-rqxw-aaxa",
+  "resolution": "1280x720",
+  "fps": 30,
+  "video_bitrate": 2000,
+  "audio_bitrate": 128,
+  "codec": "libx264",
+  "preset": "ultrafast",
+  "profile": "baseline",
+  "low_latency": false,
+  "buffer_size": 3
+}

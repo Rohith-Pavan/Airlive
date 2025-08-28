@@ -1,0 +1,26 @@
+# Core dependencies
+PyQt6==6.6.1
+PyQt6-Qt6==6.6.1
+PyQt6-sip==13.6.0
+PyQt6-Qt6-WebEngine==6.6.0
+
+# Image and video processing
+opencv-python==4.8.1.78
+numpy==1.24.3
+Pillow==10.1.0
+
+# GStreamer Python bindings
+PyGObject==3.48.2 ; sys_platform != 'win32'
+# On Windows, install PyGObject + GStreamer via MSYS2 MinGW64 or prebuilt wheels/SDK.
+# See docs for Windows setup steps.
+
+# Build and packaging
+pyinstaller==6.2.0
+
+# Optional: For future audio processing
+# sounddevice==0.4.6
+# soundfile==0.12.1
+
+# Development tools
+# autopep8==2.0.4
+# pylint==3.0.2
