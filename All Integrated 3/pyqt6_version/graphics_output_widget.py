@@ -270,6 +270,10 @@ class GraphicsOutputWidget(QGraphicsView):
                     # Add to scene
                     self.scene_obj.addItem(self.overlay_item)
                     
+                    # Force immediate visual update
+                    self.update()
+                    self.repaint()
+                    
                     print(f"Frame overlay applied: {Path(frame_path).name}")
                 else:
                     print(f"Failed to load frame: {frame_path}")
@@ -302,6 +306,11 @@ class GraphicsOutputWidget(QGraphicsView):
                     print(f"Error resetting video item: {e}")
             
             self.current_frame_path = None
+            
+            # Force immediate visual update
+            self.update()
+            self.repaint()
+            
             print("Frame overlay cleared")
         except Exception as e:
             print(f"Error clearing frame overlay: {e}")

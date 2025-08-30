@@ -855,61 +855,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"Error updating stream settings media source: {e}")
     
-    
-    def manual_clear_all_effects(self):
-        """Manual method to clear all effects - can be called anytime"""
-        try:
-            print("🧹 MANUAL CLEAR ALL EFFECTS...")
-            
-            # Clear from all frames
-            all_frames = self.findChildren(QFrame)
-            total_cleared = 0
-            
-            for frame in all_frames:
-                # Remove overlay labels
-                labels = frame.findChildren(QLabel)
-                for label in labels:
-                    if label.pixmap() and not label.pixmap().isNull():
-                        if label.parent() == frame:
-                            label.hide()
-                            label.deleteLater()
-                            total_cleared += 1
-                
-                # Clear composite widgets
-                try:
-                    from composite_output_widget import CompositeOutputWidget
-                    composites = frame.findChildren(CompositeOutputWidget)
-                    for comp in composites:
-                        comp.clear_effect_overlay()
-                        total_cleared += 1
-                except:
-                    pass
-                
-                # Force repaint
-                frame.update()
-                frame.repaint()
-            
-            # Clear from effects manager
-            if hasattr(self, 'effects_manager'):
-                try:
-                    # Clear all selections
-                    for tab_name in self.effects_manager.tab_names:
-                        self.effects_manager.selected_effects[tab_name] = None
-                        
-                        # Clear visual selections
-                        if tab_name in self.effects_manager.effect_frames:
-                            for frame in self.effects_manager.effect_frames[tab_name]:
-                                frame.set_selected(False)
-                                frame.update()
-                except Exception as e:
-                    print(f"⚠️ Effects manager clearing failed: {e}")
-            
-            print(f"✅ Manual clear complete! Cleared {total_cleared} items")
-            return True
-            
-        except Exception as e:
-            print(f"❌ Manual clear failed: {e}")
-            return False\n\n    def closeEvent(self, event):
+    def closeEvent(self, event):
         """Handle application close event"""
         try:
             print("Cleaning up resources before closing...")
@@ -972,27 +918,7 @@ class MainWindow(QMainWindow):
             # Setup effects UI
             self.setup_effects_ui()
             
-            # CRITICAL FIX: Find and make main output frame visible
-            self._setup_main_output_frame()
-            
             print("✅ Effects manager initialized with double-click removal")
-            
-            # Add keyboard shortcuts for manual clearing
-            try:
-                from PyQt6.QtGui import QShortcut, QKeySequence
-                
-                # Ctrl+X for manual clear
-                clear_shortcut = QShortcut(QKeySequence("Ctrl+X"), self)
-                clear_shortcut.activated.connect(self.manual_clear_all_effects)
-                
-                # Ctrl+Shift+X for emergency clear
-                emergency_shortcut = QShortcut(QKeySequence("Ctrl+Shift+X"), self)
-                emergency_shortcut.activated.connect(lambda: self.on_effect_removed("Manual", "emergency_clear"))
-                
-                print("✅ Added keyboard shortcuts: Ctrl+X (clear), Ctrl+Shift+X (emergency)")
-                
-            except Exception as e:
-                print(f"⚠️ Keyboard shortcuts failed: {e}")
             
         except Exception as e:
             print(f"❌ Error initializing effects manager: {e}")
@@ -1066,142 +992,43 @@ class MainWindow(QMainWindow):
             if hasattr(self, 'statusbar'):
                 self.statusbar.showMessage(f"Error applying effect: {e}", 5000)
     
-    
-    def _setup_main_output_frame(self):
-        """Setup and ensure main output frame is properly configured"""
-        try:
-            # Find the largest frame (main output)
-            frames = self.findChildren(QFrame)
-            main_output_frame = None
-            largest_size = 0
-            
-            for frame in frames:
-                size = frame.size()
-                area = size.width() * size.height()
-                if area > largest_size:
-                    largest_size = area
-                    main_output_frame = frame
-            
-            if main_output_frame:
-                # Make sure the frame is visible
-                if not main_output_frame.isVisible():
-                    main_output_frame.show()
-                    print("✅ Made main output frame visible")
-                
-                # Store reference for easy access
-                self._main_output_frame = main_output_frame
-                print(f"✅ Main output frame configured: {main_output_frame.size()}")
-            else:
-                print("⚠️ Main output frame not found")
-                
-        except Exception as e:
-            print(f"❌ Error setting up main output frame: {e}")\n\n        def on_effect_removed(self, tab_name, effect_path):
-        """Handle effect removal via double-click - FINAL ENHANCED VERSION"""
+    def on_effect_removed(self, tab_name, effect_path):
+        """Handle effect removal via double-click"""
         try:
             from pathlib import Path
             
-            print(f"🗑️ FINAL: Removing effect {Path(effect_path).name} from {tab_name}")
-            
-            # Method 1: Clear from graphics manager
+            # Remove effect from main output widget
             if hasattr(self, 'graphics_manager'):
                 self.graphics_manager.clear_frame_for_widget("main_output")
-                self.graphics_manager.clear_all_frames()
-                print("✅ Cleared from graphics manager")
             
-            # Method 2: Clear from main output frame (CRITICAL FIX)
-            if hasattr(self, '_main_output_frame') and self._main_output_frame:
-                frame = self._main_output_frame
-                
-                # Remove any overlay labels
-                overlay_labels = frame.findChildren(QLabel)
-                removed_count = 0
-                for label in overlay_labels:
-                    if label.pixmap() and not label.pixmap().isNull():
-                        # Check if this label is an effect overlay
-                        if label.parent() == frame:
-                            label.hide()
-                            label.deleteLater()
-                            removed_count += 1
-                
-                print(f"✅ Removed {removed_count} overlay labels from main frame")
-                
-                # Remove any composite widgets
-                try:
-                    from composite_output_widget import CompositeOutputWidget
-                    composite_widgets = frame.findChildren(CompositeOutputWidget)
-                    for widget in composite_widgets:
-                        widget.clear_effect_overlay()
-                        widget.hide()
-                        widget.deleteLater()
-                    
-                    if composite_widgets:
-                        print(f"✅ Removed {len(composite_widgets)} composite overlays")
-                except:
-                    pass
-                
-                # Force repaint
-                frame.update()
-                frame.repaint()
-                print("✅ Forced main frame repaint")
-            
-            # Method 3: Clear from all large frames (fallback)
-            all_frames = self.findChildren(QFrame)
-            for frame in all_frames:
-                if frame.size().width() > 400:  # Only large frames
-                    # Clear overlays
-                    for label in frame.findChildren(QLabel):
-                        if label.pixmap() and not label.pixmap().isNull():
-                            if label.parent() == frame:
-                                label.hide()
-                                label.deleteLater()
-                    
-                    # Force repaint
-                    frame.update()
-                    frame.repaint()
-            
-            # Method 4: Clear from output preview widget (legacy support)
+            # Also clear from output preview widget if it exists
             if hasattr(self, 'output_preview_widget') and self.output_preview_widget:
-                output_widget = self.output_preview_widget
-                
-                # Clear graphics scene overlays
-                if hasattr(output_widget, 'scene'):
-                    scene = output_widget.scene()
-                    if scene:
-                        items_to_remove = []
-                        for item in scene.items():
-                            if hasattr(item, 'zValue') and item.zValue() > 0:
-                                items_to_remove.append(item)
-                        
-                        for item in items_to_remove:
-                            scene.removeItem(item)
-                        
-                        print(f"✅ Removed {len(items_to_remove)} scene items")
-                
-                # Force repaint
-                output_widget.update()
-                output_widget.repaint()
-            
-            # Method 5: Clear from any graphics output widgets
-            try:
-                from graphics_output_widget import GraphicsOutputWidget
-                graphics_widgets = self.findChildren(GraphicsOutputWidget)
-                for widget in graphics_widgets:
-                    widget.clear_frame_overlay()
-                    widget.update()
-                    widget.repaint()
-                print(f"✅ Cleared {len(graphics_widgets)} graphics output widgets")
-            except Exception as e:
-                print(f"⚠️ Graphics widget clearing failed: {e}")
+                # Clear any overlay effects from the output widget
+                try:
+                    # If the output widget has a graphics scene, clear it
+                    if hasattr(self.output_preview_widget, 'clear_frame_overlay'):
+                        self.output_preview_widget.clear_frame_overlay()
+                    elif hasattr(self.output_preview_widget, 'scene'):
+                        # Clear graphics scene overlays
+                        scene = self.output_preview_widget.scene()
+                        if scene:
+                            # Remove overlay items
+                            for item in scene.items():
+                                if hasattr(item, 'zValue') and item.zValue() > 0:
+                                    scene.removeItem(item)
+                except Exception as clear_error:
+                    print(f"⚠️ Error clearing output widget overlay: {clear_error}")
             
             # Update status
             effect_name = Path(effect_path).name
-            print(f"🎉 FINAL REMOVAL COMPLETE: {effect_name}")
+            print(f"🗑️ Removed effect: {effect_name} from {tab_name}")
             
             # Optional: Update UI status if available
             if hasattr(self, 'statusbar'):
-                self.statusbar.showMessage(f"Effect removed: {effect_name}", 3000)
+                self.statusbar.showMessage(f"Removed effect: {effect_name}", 3000)
                 
         except Exception as e:
-            print(f"❌ Enhanced removal failed: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"❌ Error removing effect: {e}")
+            if hasattr(self, 'statusbar'):
+                self.statusbar.showMessage(f"Error removing effect: {e}", 5000)
+            super().closeEvent(event)

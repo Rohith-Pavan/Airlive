@@ -40,22 +40,56 @@ else:
     # Fallback classes for when GStreamer is not available
     class AudioCompositor:
         def __init__(self):
-            pass
+            self.channel_name = "fallback_audio_channel"
         def start(self):
             pass
         def stop(self):
             pass
         def cleanup(self):
             pass
+        def set_input_muted(self, name, muted):
+            pass
+        def set_monitor_muted(self, muted):
+            pass
+        def set_master_volume(self, volume):
+            pass
+        def add_auto_source(self, name):
+            pass
+        def add_media_file_source(self, name, filepath):
+            pass
+        def remove_source(self, name):
+            pass
     
     class RecordingManager:
-        def __init__(self):
-            pass
+        def __init__(self, audio_channel=None):
+            from PyQt6.QtCore import QObject, pyqtSignal
+            # Create a dummy QObject for signals
+            self._signal_obj = type('SignalObj', (QObject,), {
+                'recording_started': pyqtSignal(),
+                'recording_stopped': pyqtSignal(),
+                'recording_error': pyqtSignal(str)
+            })()
+            self.recording_started = self._signal_obj.recording_started
+            self.recording_stopped = self._signal_obj.recording_stopped
+            self.recording_error = self._signal_obj.recording_error
+            
         def start_recording(self, *args, **kwargs):
             return False
         def stop_recording(self):
             pass
         def cleanup(self):
+            pass
+        def configure_recording(self, config):
+            return True
+        def is_recording(self):
+            return False
+        def is_paused(self):
+            return False
+        def pause_recording(self):
+            return False
+        def resume_recording(self):
+            return False
+        def register_graphics_view(self, widget):
             pass
 
 from recording_settings_dialog import RecordingSettingsDialog
@@ -382,6 +416,92 @@ class VideoInputManager:
                     print(f"Warning: Button {button_name} not found in UI")
             except Exception as e:
                 print(f"Error connecting switching button {button_name}: {e}")
+
+        # Media control buttons (play/pause)
+        media_control_mappings = {
+            'pushButton_19': 'media1',
+            'pushButton_20': 'media2',
+            'pushButton_21': 'media3'
+        }
+        
+        # Load play/pause icons
+        icon_path = Path(__file__).resolve().parent / "icons"
+        play_icon = QtGui.QIcon(str(icon_path / "Play.png"))
+        pause_icon = QtGui.QIcon(str(icon_path / "Pause.png"))
+        
+        for button_name, media_name in media_control_mappings.items():
+            try:
+                if hasattr(self.window, button_name):
+                    button = getattr(self.window, button_name)
+                    if button:
+                        # Make button square and set styling
+                        button.setMinimumSize(24, 24)
+                        button.setMaximumSize(24, 24)
+                        button.setStyleSheet("""
+                            QPushButton {
+                                background-color: #404040;
+                                border: 1px solid #555555;
+                                border-radius: 4px;
+                                padding: 2px;
+                            }
+                            QPushButton:hover {
+                                background-color: #505050;
+                                border: 1px solid #666666;
+                            }
+                            QPushButton:pressed {
+                                background-color: #353535;
+                                border: 1px solid #444444;
+                            }
+                            QPushButton:checked {
+                                background-color: #0078d4;
+                                border: 1px solid #106ebe;
+                            }
+                        """)
+                        
+                        # Set initial play icon
+                        button.setIcon(play_icon)
+                        button.setIconSize(button.size() * 0.7)  # Icon slightly smaller than button
+                        
+                        # Make it a toggle button
+                        button.setCheckable(True)
+                        button.setChecked(False)  # Start in paused state
+                        
+                        # Store icons for later use
+                        button.play_icon = play_icon
+                        button.pause_icon = pause_icon
+                        
+                        button.clicked.connect(lambda checked, med=media_name: self.toggle_media_playback(med))
+                    else:
+                        print(f"Warning: Media control button {button_name} is None")
+                else:
+                    print(f"Warning: Media control button {button_name} not found in UI")
+            except Exception as e:
+                print(f"Error connecting media control button {button_name}: {e}")
+
+        # Media progress sliders
+        media_slider_mappings = {
+            'horizontalSlider': 'media1',
+            'horizontalSlider_2': 'media2',
+            'horizontalSlider_3': 'media3'
+        }
+        
+        for slider_name, media_name in media_slider_mappings.items():
+            try:
+                if hasattr(self.window, slider_name):
+                    slider = getattr(self.window, slider_name)
+                    if slider:
+                        slider.setMinimum(0)
+                        slider.setMaximum(1000)  # Use 1000 for smooth progress
+                        slider.setValue(0)
+                        slider.sliderPressed.connect(lambda med=media_name: self.on_slider_pressed(med))
+                        slider.sliderReleased.connect(lambda med=media_name: self.on_slider_released(med))
+                        slider.valueChanged.connect(lambda value, med=media_name: self.on_slider_value_changed(med, value))
+                    else:
+                        print(f"Warning: Media slider {slider_name} is None")
+                else:
+                    print(f"Warning: Media slider {slider_name} not found in UI")
+            except Exception as e:
+                print(f"Error connecting media slider {slider_name}: {e}")
 
     def _toggle_button_icon(self, button, muted: bool):
         """Ensure the icon reflects mute state even if the .ui iconset doesn't auto-toggle."""
@@ -829,6 +949,9 @@ class VideoInputManager:
                 # Auto-play the media
                 player.play()
                 print(f"Started playing media file for {media_name}")
+                
+                # Update button state to reflect playing state
+                self.update_media_button_state(media_name)
             else:
                 print(f"Error: No player found for {media_name}")
                 
@@ -880,11 +1003,14 @@ class VideoInputManager:
             self._clear_current_output()
             
             if source_type == 'input':
-                # If media pipelines were active, stop them and restart scene streams
+                # Clear any media streamers if they exist
                 try:
-                    self._stop_media_streamers(restart_scene_streams=True)
+                    if hasattr(self, '_media_streamers'):
+                        self._media_streamers.clear()
+                    if hasattr(self, '_preview_streamer'):
+                        self._preview_streamer = None
                 except Exception as _e:
-                    print(f"Warning: failed stopping media streamers on input switch: {_e}")
+                    print(f"Warning: failed clearing media streamers on input switch: {_e}")
                 # Switch camera input to output
                 if source_name in self.input_cameras and self.input_cameras[source_name]:
                     camera = self.input_cameras[source_name]
@@ -894,26 +1020,32 @@ class VideoInputManager:
                         print(f"Error: Invalid session or output widget for {source_name}")
                         return
 
-                    # Route camera frames to QVideoSink, which will feed the graphics item
-                    if self._qvideosink is not None:
-                        session.setVideoOutput(self._qvideosink)
-                    else:
-                        print("Error: QVideoSink unavailable; cannot display camera on output")
-                        return
+                    # CRITICAL FIX: Add small delay to ensure clearing is complete
+                    from PyQt6.QtCore import QTimer
+                    def _assign_camera_output():
+                        try:
+                            # Route camera frames to QVideoSink, which will feed the graphics item
+                            if self._qvideosink is not None:
+                                session.setVideoOutput(self._qvideosink)
+                                print(f"✅ Assigned {source_name} to QVideoSink")
+                            else:
+                                print("Error: QVideoSink unavailable; cannot display camera on output")
+                                return
 
-                    # Ensure camera is running
-                    if not camera.isActive():
-                        camera.start()
+                            # Ensure camera is running
+                            if not camera.isActive():
+                                camera.start()
+                                print(f"✅ Started camera {source_name}")
+                                
+                        except Exception as e:
+                            print(f"Error assigning camera output: {e}")
+                    
+                    # Use QTimer to delay the assignment slightly
+                    QTimer.singleShot(50, _assign_camera_output)
 
                     self.current_output_source = (source_type, source_name)
                     print(f"Switched output to {source_name} camera")
-                    # Ensure graphics item in 'external frame' mode
-                    try:
-                        if hasattr(self.output_preview_widget, 'set_qimage_frame'):
-                            # No immediate frame yet; handler will provide
-                            pass
-                    except Exception:
-                        pass
+                    
                     # Update audio routing: enable only this input's mic; disable others and all media audio
                     self._apply_audio_for_active_source('input', source_name)
                 else:
@@ -928,176 +1060,40 @@ class VideoInputManager:
                         print(f"Error: Invalid output widget for {source_name}")
                         return
 
-                    # By default, render using internal video rendering
-                    player.setVideoOutput(self.output_preview_widget)
+                    # CRITICAL FIX: Add small delay to ensure clearing is complete
+                    from PyQt6.QtCore import QTimer
+                    def _assign_media_output():
+                        try:
+                            # Assign video output to media player
+                            player.setVideoOutput(self.output_preview_widget)
+                            print(f"✅ Assigned {source_name} to output widget")
+                            
+                            # Ensure media is playing
+                            from PyQt6.QtMultimedia import QMediaPlayer
+                            if player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+                                player.play()
+                                print(f"✅ Started playing {source_name}")
+                            
+                        except Exception as e:
+                            print(f"Error assigning media output: {e}")
+                    
+                    # Use QTimer to delay the assignment slightly
+                    QTimer.singleShot(50, _assign_media_output)
                     
                     # AUDIO SYNC ENHANCEMENT: Increase volume when media is selected for output
                     self._set_media_audio_volume(source_name, 1.0)  # Full volume for output
-                    
-                    # If streaming is active on any streams, hand off to combined media pipeline for A/V sync
-                    uri_path = self.media_files.get(source_name)
-                    active_streams = []
-                    try:
-                        if self.stream_manager:
-                            active_streams = list(self.stream_manager.get_active_streams())
-                    except Exception as e:
-                        print(f"Warning: Failed to query active streams: {e}")
-
-                    # If currently streaming via media pipelines, stop them to switch media
-                    if self._media_streamers:
-                        # snapshot position from any active media streamer before stopping
-                        try:
-                            self._snapshot_media_position(source_name)
-                        finally:
-                            self._stop_media_streamers(restart_scene_streams=False)
-                        # Use previously active streams list for restarting media pipelines
-                        if not active_streams and self._last_active_streams:
-                            active_streams = self._last_active_streams[:]
-
-                    if uri_path and active_streams:
-                        # Stop scene-based streams first and remember which to restart later
-                        self._last_active_streams = active_streams[:]
-                        for s in active_streams:
-                            try:
-                                self.stream_manager.stop_stream(s)
-                            except Exception as e:
-                                print(f"Warning: Failed stopping scene stream {s}: {e}")
-
-                        # Start one media pipeline per active stream (supports Stream1 & Stream2)
-                        # Convert file path to file:// URI to avoid parse errors
-                        try:
-                            from pathlib import Path as _Path
-                            media_uri = _Path(uri_path).resolve().as_uri()
-                        except Exception:
-                            media_uri = uri_path
-                        for s in active_streams:
-                            try:
-                                cfg = self.stream_manager.get_stream_config(s) if self.stream_manager else None
-                                if not cfg:
-                                    print(f"Warning: No config for {s}; skipping media pipeline")
-                                    continue
-                                width, height = map(int, str(cfg['resolution']).split('x'))
-                                fps = int(cfg['fps'])
-                                vkbps = int(cfg['video_bitrate'])
-                                akbps = int(cfg.get('audio_bitrate', 128))
-                                url = str(cfg['url']).rstrip('/')
-                                key = str(cfg.get('key', ''))
-                                target = f"{url}/{key}" if key else url
-                                from pathlib import Path as _P
-                                media_uri = _P(uri_path).resolve().as_uri()
-
-                                pipeline_desc = build_media_rtmp_pipeline(media_uri, width, height, fps, target, vkbps, akbps)
-
-                                def _deliver_preview(qimg, _self=self):
-                                    # marshal to UI thread
-                                    try:
-                                        QTimer.singleShot(0, lambda img=qimg: hasattr(_self.output_preview_widget, 'set_qimage_frame') and _self.output_preview_widget.set_qimage_frame(img))
-                                    except Exception as _e:
-                                        print(f"Preview delivery error: {_e}")
-
-                                streamer = GstMediaRtmpStreamer(pipeline_desc, _deliver_preview)
-                                streamer.start()
-                                # seek to last saved position if available
-                                try:
-                                    last_pos = int(self._media_positions_ns.get(source_name, 0) or 0)
-                                    if last_pos > 0:
-                                        streamer.pause()
-                                        streamer.seek_ns(last_pos)
-                                        streamer.play()
-                                except Exception:
-                                    pass
-                                self._media_streamers[s] = streamer
-                            except Exception as e:
-                                print(f"Error starting media pipeline for {s}: {e}")
-
-                        # Ensure internal renderer is cleared; preview will arrive via QImage from media pipeline
-                        try:
-                            if hasattr(self.output_preview_widget, 'set_qimage_frame'):
-                                self.output_preview_widget.set_qimage_frame(None)
-                        except Exception:
-                            pass
-                        # Silence AudioCompositor to avoid double monitor audio; monitor comes from media pipeline now
-                        try:
-                            self._silence_audio_compositor_for_media_monitor()
-                        except Exception as _e:
-                            print(f"Warning: failed silencing AudioCompositor during media monitor: {_e}")
-                    else:
-                        # No active streaming; play preview using a low-latency A/V-synced GStreamer pipeline
-                        if uri_path:
-                            # Stop any existing preview streamer
-                            try:
-                                if self._preview_streamer:
-                                    # snapshot current preview position before stopping
-                                    try:
-                                        self._snapshot_media_position(source_name)
-                                    except Exception:
-                                        pass
-                                    self._preview_streamer.stop()
-                                    self._preview_streamer = None
-                            except Exception:
-                                self._preview_streamer = None
-
-                            # Determine preview size and fps
-                            try:
-                                width = int(getattr(self.output_preview_widget, 'width', lambda: 1280)())
-                                height = int(getattr(self.output_preview_widget, 'height', lambda: 720)())
-                                if width <= 0 or height <= 0:
-                                    width, height = 1280, 720
-                            except Exception:
-                                width, height = 1280, 720
-                            fps = 30
-
-                            # Build preview pipeline and start
-                            # Convert file path to file:// URI for GStreamer
-                            try:
-                                from pathlib import Path as _Path
-                                media_uri = _Path(uri_path).resolve().as_uri()
-                            except Exception:
-                                media_uri = uri_path
-                            pipeline_desc = build_media_preview_pipeline(media_uri, width, height, fps)
-
-                            def _deliver_preview(sample_qimg):
-                                img = sample_qimg
-                                _self = self
-                                try:
-                                    QTimer.singleShot(0, lambda img=img: hasattr(_self.output_preview_widget, 'set_qimage_frame') and _self.output_preview_widget.set_qimage_frame(img))
-                                except Exception as _e:
-                                    print(f"Preview delivery error: {_e}")
-
-                            try:
-                                preview_streamer = GstMediaRtmpStreamer(pipeline_desc, _deliver_preview)
-                                preview_streamer.start()
-                                # seek to last saved position if available
-                                try:
-                                    last_pos = int(self._media_positions_ns.get(source_name, 0) or 0)
-                                    if last_pos > 0:
-                                        preview_streamer.pause()
-                                        preview_streamer.seek_ns(last_pos)
-                                        preview_streamer.play()
-                                except Exception:
-                                    pass
-                                self._preview_streamer = preview_streamer
-                            except Exception as e:
-                                print(f"Error starting preview pipeline: {e}")
-
-                            # Silence AudioCompositor; monitor audio comes from preview pipeline
-                            try:
-                                self._silence_audio_compositor_for_media_monitor()
-                            except Exception as _e:
-                                print(f"Warning: failed silencing AudioCompositor during preview: {_e}")
 
                     self.current_output_source = (source_type, source_name)
                     print(f"Switched output to {source_name} media")
-                    # AUDIO SYNC FIX: Don't use AudioCompositor for media - we have direct QAudioOutput control
-                    # This prevents duplicate audio streams
-                    if not active_streams:
-                        # Remove all media from AudioCompositor to prevent duplicate audio
-                        self._remove_all_media_from_audio_compositor()
-                        # Ensure all other media is muted
-                        self._mute_all_media_audio()
-                        # Then unmute only the active media
-                        self._set_media_audio_volume(source_name, 1.0)
-                        print(f"✅ Audio sync: Using direct audio control, AudioCompositor bypassed")
+                    
+                    # AUDIO SYNC FIX: Use direct QAudioOutput control for reliable audio
+                    # Remove all media from AudioCompositor to prevent duplicate audio
+                    self._remove_all_media_from_audio_compositor()
+                    # Ensure all other media is muted
+                    self._mute_all_media_audio()
+                    # Then unmute only the active media
+                    self._set_media_audio_volume(source_name, 1.0)
+                    print(f"✅ Audio sync: Using direct audio control, AudioCompositor bypassed")
                 else:
                     print(f"No media file assigned to {source_name}. Please select a media file first.")
 
@@ -1107,6 +1103,8 @@ class VideoInputManager:
     def _clear_current_output(self):
         """Clear current output connections to prevent conflicts"""
         try:
+            print(f"Clearing current output: {self.current_output_source}")
+            
             # Snapshot position for current media before tearing down
             try:
                 if self.current_output_source and self.current_output_source[0] == 'media':
@@ -1124,22 +1122,67 @@ class VideoInputManager:
                             print(f"Warning: Could not remove {media_name} from AudioCompositor: {e}")
             except Exception:
                 pass
-            # Clear all camera sessions from output
-            for session in self.input_sessions.values():
-                if session and hasattr(session, 'videoOutput'):
-                    vo = session.videoOutput()
-                    if vo is not None and (vo == self.output_preview_widget or vo == self._qvideosink):
-                        session.setVideoOutput(None)
+                
+            # CRITICAL FIX: Clear ALL video output connections completely
+            
+            # 1. Clear all camera sessions from ALL possible outputs
+            for input_name, session in self.input_sessions.items():
+                if session:
+                    try:
+                        # Clear from QVideoSink
+                        if self._qvideosink and session.videoOutput() == self._qvideosink:
+                            session.setVideoOutput(None)
+                            print(f"✅ Cleared {input_name} from QVideoSink")
+                        
+                        # Clear from direct output widget
+                        if hasattr(session, 'videoOutput') and session.videoOutput() == self.output_preview_widget:
+                            session.setVideoOutput(None)
+                            print(f"✅ Cleared {input_name} from output widget")
+                            
+                    except Exception as e:
+                        print(f"Warning: Error clearing {input_name} session: {e}")
 
-            # Clear all media players from output and mute their audio
+            # 2. Clear all media players from output and mute their audio
             for media_name, player in self.media_players.items():
-                if player and hasattr(player, 'videoOutput') and player.videoOutput() == self.output_preview_widget:
-                    player.setVideoOutput(None)
-                    
-                    # AUDIO SYNC ENHANCEMENT: Mute audio when media is no longer active
-                    self._set_media_audio_volume(media_name, 0.0)  # Mute for preview
+                if player:
+                    try:
+                        # Clear video output if connected
+                        if hasattr(player, 'videoOutput') and player.videoOutput() == self.output_preview_widget:
+                            player.setVideoOutput(None)
+                            print(f"✅ Cleared {media_name} from output widget")
+                        
+                        # Mute audio when media is no longer active
+                        self._set_media_audio_volume(media_name, 0.0)
+                        
+                    except Exception as e:
+                        print(f"Warning: Error clearing {media_name} player: {e}")
+            
+            # 3. CRITICAL: Clear the graphics video item if it exists
+            try:
+                if hasattr(self.output_preview_widget, 'clear_video_frame'):
+                    self.output_preview_widget.clear_video_frame()
+                    print("✅ Cleared graphics video frame")
+                elif hasattr(self.output_preview_widget, 'set_qimage_frame'):
+                    self.output_preview_widget.set_qimage_frame(None)
+                    print("✅ Cleared graphics QImage frame")
+            except Exception as e:
+                print(f"Warning: Could not clear graphics frame: {e}")
+            
+            # 4. Force a visual update
+            try:
+                if hasattr(self.output_preview_widget, 'update'):
+                    self.output_preview_widget.update()
+                if hasattr(self.output_preview_widget, 'repaint'):
+                    self.output_preview_widget.repaint()
+            except Exception as e:
+                print(f"Warning: Could not force visual update: {e}")
+                
+            print("✅ Output cleared successfully")
+            
         except Exception as e:
             print(f"Error clearing output: {e}")
+            import traceback
+            traceback.print_exc()
     
     def _set_media_audio_volume(self, media_name, volume):
         """Set audio volume for a specific media player (0.0 = muted, 1.0 = full)"""
@@ -1296,6 +1339,164 @@ class VideoInputManager:
         except Exception as e:
             print(f"Error during VideoInputManager cleanup: {e}")
 
+    # Media Control Methods
+    def toggle_media_playback(self, media_name):
+        """Toggle play/pause for a media player"""
+        try:
+            player = self.media_players.get(media_name)
+            if not player:
+                print(f"No media player found for {media_name}")
+                return
+            
+            # Get the corresponding button to update its state
+            button_mapping = {
+                'media1': 'pushButton_19',
+                'media2': 'pushButton_20', 
+                'media3': 'pushButton_21'
+            }
+            
+            button_name = button_mapping.get(media_name)
+            button = getattr(self.window, button_name, None) if button_name else None
+            
+            # Check current state and toggle
+            from PyQt6.QtMultimedia import QMediaPlayer
+            if player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+                # Currently playing, so pause
+                player.pause()
+                if button:
+                    button.setChecked(False)
+                    # Update icon to play (since we're now paused)
+                    if hasattr(button, 'play_icon'):
+                        button.setIcon(button.play_icon)
+                print(f"Paused {media_name}")
+            else:
+                # Currently paused or stopped, so play
+                player.play()
+                if button:
+                    button.setChecked(True)
+                    # Update icon to pause (since we're now playing)
+                    if hasattr(button, 'pause_icon'):
+                        button.setIcon(button.pause_icon)
+                print(f"Playing {media_name}")
+                
+        except Exception as e:
+            print(f"Error toggling playback for {media_name}: {e}")
+    
+    def on_slider_pressed(self, media_name):
+        """Handle when user starts dragging the progress slider"""
+        try:
+            # Store that user is dragging to prevent automatic updates
+            if not hasattr(self, '_slider_dragging'):
+                self._slider_dragging = {}
+            self._slider_dragging[media_name] = True
+        except Exception as e:
+            print(f"Error on slider pressed for {media_name}: {e}")
+    
+    def on_slider_released(self, media_name):
+        """Handle when user releases the progress slider"""
+        try:
+            # Clear dragging state
+            if hasattr(self, '_slider_dragging'):
+                self._slider_dragging[media_name] = False
+        except Exception as e:
+            print(f"Error on slider released for {media_name}: {e}")
+    
+    def on_slider_value_changed(self, media_name, value):
+        """Handle progress slider value changes"""
+        try:
+            # Only seek if user is dragging (not automatic updates)
+            if hasattr(self, '_slider_dragging') and self._slider_dragging.get(media_name, False):
+                player = self.media_players.get(media_name)
+                if player and player.duration() > 0:
+                    # Convert slider value (0-1000) to position in milliseconds
+                    position = int((value / 1000.0) * player.duration())
+                    player.setPosition(position)
+                    print(f"Seeking {media_name} to {position}ms")
+        except Exception as e:
+            print(f"Error on slider value changed for {media_name}: {e}")
+    
+    def setup_media_progress_updates(self):
+        """Set up automatic progress updates for media sliders"""
+        try:
+            # Create timers for updating progress sliders
+            if not hasattr(self, '_progress_timers'):
+                self._progress_timers = {}
+                self._slider_dragging = {}
+            
+            from PyQt6.QtCore import QTimer
+            
+            for media_name in ['media1', 'media2', 'media3']:
+                # Create timer for this media
+                timer = QTimer()
+                timer.timeout.connect(lambda mn=media_name: self.update_media_progress(mn))
+                timer.start(100)  # Update every 100ms for smooth progress
+                self._progress_timers[media_name] = timer
+                self._slider_dragging[media_name] = False
+                
+        except Exception as e:
+            print(f"Error setting up media progress updates: {e}")
+    
+    def update_media_progress(self, media_name):
+        """Update progress slider for a media player"""
+        try:
+            # Don't update if user is dragging
+            if self._slider_dragging.get(media_name, False):
+                return
+                
+            player = self.media_players.get(media_name)
+            if not player or player.duration() <= 0:
+                return
+            
+            # Get the corresponding slider
+            slider_mapping = {
+                'media1': 'horizontalSlider',
+                'media2': 'horizontalSlider_2',
+                'media3': 'horizontalSlider_3'
+            }
+            
+            slider_name = slider_mapping.get(media_name)
+            slider = getattr(self.window, slider_name, None) if slider_name else None
+            
+            if slider:
+                # Calculate progress (0-1000)
+                progress = int((player.position() / player.duration()) * 1000)
+                slider.setValue(progress)
+                
+        except Exception as e:
+            print(f"Error updating progress for {media_name}: {e}")
+    
+    def update_media_button_state(self, media_name):
+        """Update the media control button state based on player state"""
+        try:
+            player = self.media_players.get(media_name)
+            if not player:
+                return
+                
+            # Get the corresponding button
+            button_mapping = {
+                'media1': 'pushButton_19',
+                'media2': 'pushButton_20', 
+                'media3': 'pushButton_21'
+            }
+            
+            button_name = button_mapping.get(media_name)
+            button = getattr(self.window, button_name, None) if button_name else None
+            
+            if button:
+                from PyQt6.QtMultimedia import QMediaPlayer
+                is_playing = player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+                
+                button.setChecked(is_playing)
+                
+                # Update icon based on state
+                if is_playing and hasattr(button, 'pause_icon'):
+                    button.setIcon(button.pause_icon)
+                elif not is_playing and hasattr(button, 'play_icon'):
+                    button.setIcon(button.play_icon)
+                    
+        except Exception as e:
+            print(f"Error updating button state for {media_name}: {e}")
+
 
 def main():
     # Enable high DPI scaling
@@ -1374,6 +1575,9 @@ def main():
     # Provide audio compositor to video manager for mute hooks
     video_input_manager.audio_compositor = audio_compositor
     
+    # Set up media progress updates
+    video_input_manager.setup_media_progress_updates()
+    
     # Connect video manager to graphics widget's video item
     video_item = graphics_manager.get_video_item_for_output("main_output")
     if video_item:
@@ -1411,10 +1615,17 @@ def main():
         # Apply frame effect to graphics output
         graphics_manager.set_frame_for_widget("main_output", effect_path)
     
-    effects_manager.effect_selected.connect(on_effect_selected)
+    # Connect effects removal signal
+    def on_effect_removed(tab_name, effect_path):
+        print(f"Effect removed from {tab_name}: {effect_path}")
+        # Clear frame effect from graphics output
+        graphics_manager.clear_frame_for_widget("main_output")
     
-    # Initialize new streaming system (GStreamer) using AudioCompositor's interaudio channel
-    stream_manager = NewStreamManager(audio_channel=audio_compositor.channel_name)
+    effects_manager.effect_selected.connect(on_effect_selected)
+    effects_manager.effect_removed.connect(on_effect_removed)
+    
+    # Initialize new streaming system (fallback) 
+    stream_manager = NewStreamManager()
     
     # Register the graphics output widget for streaming
     graphics_widget = graphics_manager.get_output_widget("main_output")

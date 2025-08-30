@@ -7,7 +7,8 @@ Handles PNG loading, display, and selection functionality for effects tabs
 import os
 from pathlib import Path
 from PyQt6.QtWidgets import QLabel, QVBoxLayout, QFrame
-from PyQt6.QtCore import Qt, pyqtSignal, QObject
+from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer
+import time
 from PyQt6.QtGui import QPixmap, QPainter, QPen, QColor
 
 class EffectFrame(QFrame):
@@ -21,6 +22,14 @@ class EffectFrame(QFrame):
         self.tab_name = tab_name
         self.effect_path = effect_path
         self.is_selected = False
+        
+        # Double-click detection
+        self.click_timer = QTimer()
+        self.click_timer.setSingleShot(True)
+        self.click_timer.timeout.connect(self._handle_single_click)
+        self.pending_click = False
+        self.last_click_time = 0
+        self.double_click_threshold = 250  # ms - Reduced for faster response
         
         # Set up the frame properties
         self.setMinimumSize(160, 90)
@@ -73,16 +82,38 @@ class EffectFrame(QFrame):
             self.setStyleSheet("background-color: #404040; border-radius: 8px;")
     
     def mousePressEvent(self, event):
-        """Handle mouse click events"""
+        """Handle mouse click events with custom double-click detection"""
         if event.button() == Qt.MouseButton.LeftButton and self.effect_path:
-            self.clicked.emit(self.tab_name, self.effect_path)
+            current_time = time.time() * 1000  # Convert to milliseconds
+            
+            # Check if this is a double-click
+            if (current_time - self.last_click_time) < self.double_click_threshold:
+                # This is a double-click
+                self.click_timer.stop()  # Cancel any pending single click
+                self.pending_click = False
+                
+                # Only allow removal if effect is selected
+                if self.is_selected:
+                    self.double_clicked.emit(self.tab_name, self.effect_path)
+                    print(f"🔄 Double-click detected on selected effect: {Path(self.effect_path).name}")
+                else:
+                    print(f"⚠️ Double-click on unselected effect ignored: {Path(self.effect_path).name}")
+            else:
+                # This might be a single click, wait to see if double-click follows
+                self.click_timer.stop()  # Stop any existing timer
+                self.pending_click = True
+                self.click_timer.start(self.double_click_threshold)
+            
+            self.last_click_time = current_time
+        
         super().mousePressEvent(event)
     
-    def mouseDoubleClickEvent(self, event):
-        """Handle mouse double-click events for effect removal"""
-        if event.button() == Qt.MouseButton.LeftButton and self.effect_path and self.is_selected:
-            self.double_clicked.emit(self.tab_name, self.effect_path)
-        super().mouseDoubleClickEvent(event)
+    def _handle_single_click(self):
+        """Handle delayed single click (only if not part of double-click)"""
+        if self.pending_click and self.effect_path:
+            self.pending_click = False
+            self.clicked.emit(self.tab_name, self.effect_path)
+            print(f"👆 Single-click detected on {Path(self.effect_path).name}")
 
 class EffectsManager(QObject):
     """Manager class for handling effects across all tabs"""
@@ -165,19 +196,21 @@ class EffectsManager(QObject):
                 child.widget().deleteLater()
     
     def on_effect_clicked(self, tab_name, effect_path):
-        """Handle effect selection"""
-        # Clear previous selection in this tab
+        """Handle effect selection with optimized performance"""
+        # Clear previous selection in this tab with immediate visual update
         if self.selected_effects[tab_name]:
             for frame in self.effect_frames[tab_name]:
                 if frame.effect_path == self.selected_effects[tab_name]:
                     frame.set_selected(False)
+                    frame.update()  # Force immediate visual update
                     break
         
-        # Set new selection
+        # Set new selection with immediate visual update
         self.selected_effects[tab_name] = effect_path
         for frame in self.effect_frames[tab_name]:
             if frame.effect_path == effect_path:
                 frame.set_selected(True)
+                frame.update()  # Force immediate visual update
                 break
         
         # Emit signals for external handling
@@ -185,19 +218,22 @@ class EffectsManager(QObject):
     
     def on_effect_double_clicked(self, tab_name, effect_path):
         """Handle effect removal via double-click"""
-        # Clear the selection in this tab
+        # Clear the selection in this tab immediately for instant visual feedback
         if self.selected_effects[tab_name] == effect_path:
             for frame in self.effect_frames[tab_name]:
                 if frame.effect_path == effect_path:
                     frame.set_selected(False)
+                    # Force immediate visual update
+                    frame.update()
+                    frame.repaint()
                     break
             
             # Clear the selected effect
             self.selected_effects[tab_name] = None
             
-            # Emit removal signal for external handling
+            # Emit removal signal for external handling (this should clear the output)
             self.effect_removed.emit(tab_name, effect_path)
-            print(f"Effect removed from {tab_name}: {Path(effect_path).name}")
+            print(f"🗑️ Effect removed from {tab_name}: {Path(effect_path).name}")
     
     def get_selected_effect(self, tab_name):
         """Get the currently selected effect for a tab"""
