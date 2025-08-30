@@ -101,7 +101,7 @@ def build_rtmp_av_pipeline(width: int, height: int, fps: int, rtmp_url: str, aud
         "videoconvert ! x264enc tune=zerolatency bitrate={vkbps} speed-preset=veryfast key-int-max={gop} ! "
         f"{vq} ! mux. "
         # Make audio explicitly live and timestamped; convert to standard 48k stereo before encoding
-        f"interaudiosrc channel={audio_channel} is-live=true do-timestamp=true ! "
+        f"interaudiosrc channel={audio_channel} do-timestamp=true ! "
         "audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 ! "
         "{aac} bitrate={a_bps} ! "
         f"{aq} ! mux. "
