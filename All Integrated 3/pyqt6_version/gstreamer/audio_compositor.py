@@ -79,6 +79,11 @@ class AudioCompositor:
             self._monitor_sink.set_property("sync", False)
         except Exception:
             pass
+        # Lower mixer latency for faster switch response (default often ~20ms)
+        try:
+            self._mixer.set_property("latency", 10_000_000)  # 10 ms in ns
+        except Exception:
+            pass
         # Configure inter-audio channel so other pipelines can read from it
         try:
             self._inter_sink.set_property("channel", self.channel_name)
@@ -158,6 +163,13 @@ class AudioCompositor:
             raise RuntimeError(f"Failed to create input elements for {name}")
 
         vol.set_property("volume", 1.0)
+        try:
+            q.set_property("leaky", 2)  # downstream
+            q.set_property("max-size-buffers", 0)
+            q.set_property("max-size-bytes", 0)
+            q.set_property("max-size-time", 0)
+        except Exception:
+            pass
 
         for el in (src, conv, res, vol, q):
             self._pipeline.add(el)
@@ -216,8 +228,19 @@ class AudioCompositor:
             uri = f"file://{file_path}"
         decode.set_property("uri", uri)
 
-        # Default volume
+        # Default volume and start muted; we will unmute the active source instantly on switch
         vol.set_property("volume", 1.0)
+        try:
+            vol.set_property("mute", True)
+        except Exception:
+            pass
+        try:
+            q.set_property("leaky", 2)  # downstream
+            q.set_property("max-size-buffers", 0)
+            q.set_property("max-size-bytes", 0)
+            q.set_property("max-size-time", 0)
+        except Exception:
+            pass
 
         for el in (decode, conv, res, vol, q):
             self._pipeline.add(el)
@@ -305,6 +328,20 @@ class AudioCompositor:
             self._master_volume.set_property("volume", max(0.0, min(1.0, float(volume))))
         except Exception:
             pass
+
+    def set_input_muted(self, name: str, muted: bool) -> None:
+        """Toggle per-input mute for instant audio cut/enable."""
+        info = self._inputs.get(name)
+        if not info:
+            return
+        volume_el: Optional[Gst.Element] = info.get('volume')
+        if volume_el is None:
+            return
+        try:
+            volume_el.set_property('mute', bool(muted))
+        except Exception:
+            # Fallback to volume if mute not supported (should be supported)
+            volume_el.set_property('volume', 0.0 if muted else 1.0)
 
     def set_monitor_muted(self, muted: bool) -> None:
         """Mute/unmute only the monitor branch (does not affect stream)."""

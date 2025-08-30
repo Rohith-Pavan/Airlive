@@ -36,11 +36,12 @@ class RecordingState:
     STOPPED = "stopped"
     STARTING = "starting"
     RUNNING = "running"
+    PAUSED = "paused"
     STOPPING = "stopping"
     ERROR = "error"
 
 
-def build_file_av_pipeline(width: int, height: int, fps: int, out_path: str, audio_channel: str, video_kbps: int, audio_kbps: int) -> str:
+def build_file_av_pipeline(width: int, height: int, fps: int, out_path: str, audio_channel: str, video_kbps: int, audio_kbps: int, video_format: str = 'mp4') -> str:
     """Build a GStreamer pipeline description string to save to a local MP4 file."""
     # Ensure GStreamer is initialized before querying factories
     if not Gst.is_initialized():
@@ -60,21 +61,97 @@ def build_file_av_pipeline(width: int, height: int, fps: int, out_path: str, aud
     aq = "queue max-size-buffers=0 max-size-bytes=0 max-size-time=0"
     a_bps = max(16, int(audio_kbps)) * 1000
 
+    muxer_map = {
+        'mp4': 'mp4mux',
+        'mkv': 'matroskamux',
+        'avi': 'avimux',
+        'flv': 'flvmux',
+    }
+    muxer_name = muxer_map.get(video_format.lower(), 'mp4mux')
+    muxer = muxer_name
+    mux_props = ""
+    if muxer_name == 'mp4mux':
+        # Write moov at the start so Windows players open it immediately
+        mux_props = " faststart=true"
+
+    # Ensure minimum bitrate for x264enc to work properly (based on resolution)
+    req_min = 500
+    if height >= 1080:
+        req_min = 4000
+    elif height >= 720:
+        req_min = 2500
+    v_kbps = max(req_min, int(video_kbps))
+    
+    # Select best available H.264 encoder by priority (hardware > software)
+    enc_priority = [
+        # NVIDIA (Windows/Linux)
+        'nvh264enc',
+        # macOS VideoToolbox
+        'vtenc_h264',
+        # Windows D3D11 (AMD/Intel via MF or AMF)
+        'd3d11h264enc',
+        # Intel VAAPI (Linux)
+        'vaapih264enc',
+        # Intel QuickSync (older/newer)
+        'qsvh264enc', 'msdkh264enc',
+        # AMD AMF
+        'amfh264enc',
+        # Software encoders
+        'x264enc', 'openh264enc', 'avenc_h264',
+    ]
+
+    available = [name for name in enc_priority if Gst.ElementFactory.find(name)]
+    if not available:
+        raise RuntimeError("No H.264 encoder found. Please install GStreamer plugins (bad/ugly/libav).")
+    h264_enc = available[0]
+
+    # Bitrate unit differences
+    bps_encoders = {'vtenc_h264', 'd3d11h264enc', 'openh264enc', 'avenc_h264'}
+    kbps_encoders = {'x264enc', 'nvh264enc', 'vaapih264enc', 'qsvh264enc', 'msdkh264enc', 'amfh264enc'}
+
+    v_bps = max(100_000, int(v_kbps) * 1000)
+    v_kbps_final = max(1, int(v_kbps))
+
+    if h264_enc in bps_encoders:
+        enc_props = f"bitrate={v_bps}"
+    else:
+        enc_props = f"bitrate={v_kbps_final}"
+
+    # Add low-latency knobs for specific encoders
+    if h264_enc == 'x264enc':
+        enc_extra = f" tune=zerolatency speed-preset=ultrafast threads=0 sliced-threads=true bframes=0 key-int-max={max(1, int(fps))} byte-stream=false"
+    elif h264_enc == 'vtenc_h264':
+        # VideoToolbox: use realtime mode, and avoid frame reordering for latency
+        # Props vary by version; these are commonly available.
+        enc_extra = f" realtime=true allow-frame-reordering=false max-keyframe-interval={max(1, int(fps))}"
+    else:
+        enc_extra = ""
+
+    # Use forward slashes for GStreamer on Windows
+    gst_path = out_path.replace('\\', '/')
+
     desc = (
-        "appsrc name=qtappsrc is-live=true format=time do-timestamp=true ! "
-        f"video/x-raw,format=BGRA,width={width},height={height},framerate={fps}/1 ! "
-        f"videoconvert ! x264enc tune=zerolatency bitrate={{vkbps}} speed-preset=veryfast key-int-max={{gop}} ! "
+        "appsrc name=qtappsrc is-live=true format=time do-timestamp=true block=false ! "
+        # Keep this queue minimal to avoid latency buildup
+        "queue leaky=downstream max-size-buffers=0 max-size-bytes=0 max-size-time=0 ! "
+        f"video/x-raw,format=BGRx,width={width},height={height},framerate={fps}/1 ! "
+        "videoconvert ! queue ! "
+        f"{h264_enc} {enc_props}{enc_extra} ! "
+        # Ensure proper format for MP4; set caps after parser
+        "h264parse config-interval=-1 ! video/x-h264,stream-format=avc,alignment=au ! "
         f"{vq} ! mux. "
-        f"interaudiosrc channel={audio_channel} ! audioconvert ! audioresample ! {{aac}} bitrate={{a_bps}} ! "
+        f"interaudiosrc channel={audio_channel} ! audioconvert ! audioresample ! {aac_enc} bitrate={a_bps} ! "
         f"{aq} ! mux. "
-        f"mp4mux name=mux ! filesink location=\"{out_path}\""
+        f"{muxer}{mux_props} name=mux ! filesink location=\"{gst_path}\""
     )
-    return desc.format(vkbps=max(100, int(video_kbps)), gop=max(1, int(fps)), a_bps=a_bps, aac=aac_enc)
+    return desc
 
 
 class RecordingManager(QObject):
     recording_started = pyqtSignal()
     recording_stopped = pyqtSignal()
+    recording_paused = pyqtSignal()
+    recording_resumed = pyqtSignal()
     recording_error = pyqtSignal(str)
 
     def __init__(self, audio_channel: str = "ac_audio_bus", parent: Optional[QObject] = None):
@@ -103,8 +180,9 @@ class RecordingManager(QObject):
             return False
 
     def start_recording(self) -> bool:
-        if self.is_recording():
-            return True
+        if self._state != RecordingState.STOPPED:
+            print(f"[RecMan] Cannot start, current state is {self._state}")
+            return False
         if not self._config:
             self.recording_error.emit("Recording not configured")
             return False
@@ -112,8 +190,7 @@ class RecordingManager(QObject):
             self.recording_error.emit("Graphics view not registered")
             return False
 
-        self.stop_recording()  # Ensure clean state
-
+        self._state = RecordingState.STARTING
         try:
             width, height = map(int, self._config['resolution'].split('x'))
             fps = int(self._config['fps'])
@@ -122,16 +199,21 @@ class RecordingManager(QObject):
             out_path = os.path.abspath(self._config['output_path'])
 
             # Ensure output directory exists
-            Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+            out_dir = Path(out_path).parent
+            out_dir.mkdir(parents=True, exist_ok=True)
+            print(f"[RecMan] Output directory: {out_dir}")
+            print(f"[RecMan] Output file path: {out_path}")
 
-            pipeline_desc = build_file_av_pipeline(width, height, fps, out_path, self._audio_channel, v_kbps, a_kbps)
+            video_format = self._config.get('video_format', 'mp4')
+            pipeline_desc = build_file_av_pipeline(width, height, fps, out_path, self._audio_channel, v_kbps, a_kbps, video_format)
+            print(f"[RecMan] Pipeline: {pipeline_desc}")
 
-            if hasattr(self._graphics_view, 'scene') and self._graphics_view.scene():
-                scene = self._graphics_view.scene()
-            else:
-                scene = self._graphics_view  # QWidget with render()
+            # Always pass the view/widget; streamer will grab from viewport when available
+            scene = self._graphics_view
+            print(f"[RecMan] Using widget for capture: {type(scene).__name__}")
             
             size = QSize(width, height)
+            print(f"[RecMan] Recording size: {width}x{height} at {fps}fps")
             self._scene_streamer = QtSceneToGstStreamer(scene, size, fps, pipeline_desc, self)
             self._scene_streamer.start()
             
@@ -145,19 +227,55 @@ class RecordingManager(QObject):
             print(f"[RecMan] Error starting recording: {e}")
             return False
 
+    def pause_recording(self) -> bool:
+        if self._state == RecordingState.RUNNING and self._scene_streamer:
+            # Assuming the streamer has a pause method
+            if hasattr(self._scene_streamer, 'pause') and self._scene_streamer.pause():
+                self._state = RecordingState.PAUSED
+                self.recording_paused.emit()
+                print("[RecMan] Recording paused")
+                return True
+        return False
+
+    def resume_recording(self) -> bool:
+        if self._state == RecordingState.PAUSED and self._scene_streamer:
+            # Assuming the streamer has a resume method
+            if hasattr(self._scene_streamer, 'resume') and self._scene_streamer.resume():
+                self._state = RecordingState.RUNNING
+                self.recording_resumed.emit()
+                print("[RecMan] Recording resumed")
+                return True
+        return False
+
     def stop_recording(self) -> bool:
+        if self._state in [RecordingState.STOPPED, RecordingState.STOPPING]:
+            return True
+
+        self._state = RecordingState.STOPPING
         if self._scene_streamer:
             self._scene_streamer.stop()
             self._scene_streamer = None
         
-        if self._state != RecordingState.STOPPED:
-            self._state = RecordingState.STOPPED
-            self.recording_stopped.emit()
-            print("[RecMan] Recording stopped")
+        self._state = RecordingState.STOPPED
+        self.recording_stopped.emit()
+        print("[RecMan] Recording stopped")
+        
+        # Check if file was created
+        if self._config and 'output_path' in self._config:
+            out_path = os.path.abspath(self._config['output_path'])
+            if os.path.exists(out_path):
+                file_size = os.path.getsize(out_path)
+                print(f"[RecMan] Recording file created: {out_path} ({file_size} bytes)")
+            else:
+                print(f"[RecMan] WARNING: Recording file not found: {out_path}")
+        
         return True
 
     def is_recording(self) -> bool:
-        return self._state == RecordingState.RUNNING
+        return self._state in [RecordingState.RUNNING, RecordingState.PAUSED, RecordingState.STARTING]
+
+    def is_paused(self) -> bool:
+        return self._state == RecordingState.PAUSED
 
     def get_state(self) -> str:
         return self._state

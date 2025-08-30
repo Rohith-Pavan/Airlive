@@ -1,0 +1,14 @@
+{
+  "platform": "Custom RTMP",
+  "url": "rtmp://b.rtmp.youtube.com/live2?backup=1",
+  "key": "fmeb-a07u-why3-rqxw-aaxa",
+  "resolution": "1280x720",
+  "fps": 30,
+  "video_bitrate": 2500,
+  "audio_bitrate": 128,
+  "codec": "libx264",
+  "preset": "veryfast",
+  "profile": "main",
+  "low_latency": false,
+  "buffer_size": 2
+}

@@ -521,8 +521,19 @@ class NewStreamManager(QObject):
     def configure_stream(self, stream_name: str, settings: Dict[str, Any]) -> bool:
         """Configure stream with validation"""
         try:
-            # Validate settings
-            required_keys = ['url', 'key', 'resolution', 'fps', 'video_bitrate']
+            # Check if this is HDMI streaming
+            if settings.get('is_hdmi', False):
+                # Validate HDMI settings
+                if settings.get('hdmi_display_index', -1) == -1:
+                    self.stream_error.emit(stream_name, "Invalid HDMI display selection")
+                    return False
+                
+                # HDMI streams don't need URL/key validation
+                required_keys = ['resolution', 'fps', 'video_bitrate']
+            else:
+                # Validate regular streaming settings
+                required_keys = ['url', 'key', 'resolution', 'fps', 'video_bitrate']
+            
             for key in required_keys:
                 if key not in settings or not settings[key]:
                     self.stream_error.emit(stream_name, f"Missing required setting: {key}")
@@ -530,7 +541,11 @@ class NewStreamManager(QObject):
             
             # Store settings
             self._streams[stream_name] = settings.copy()
-            print(f"Configured {stream_name}: {settings.get('resolution')} @ {settings.get('fps')}fps")
+            
+            if settings.get('is_hdmi', False):
+                print(f"Configured HDMI {stream_name}: Display {settings.get('hdmi_display_index')} - {settings.get('resolution')} @ {settings.get('fps')}fps")
+            else:
+                print(f"Configured {stream_name}: {settings.get('resolution')} @ {settings.get('fps')}fps")
             return True
             
         except Exception as e:
@@ -556,8 +571,21 @@ class NewStreamManager(QObject):
             # Stop existing worker if any
             self._stop_worker(stream_name)
             
-            # Create and start worker
             settings = self._streams[stream_name]
+            
+            # Handle HDMI streaming
+            if settings.get('is_hdmi', False):
+                return self._start_hdmi_stream(stream_name, settings)
+            else:
+                return self._start_regular_stream(stream_name, settings)
+            
+        except Exception as e:
+            self.stream_error.emit(stream_name, f"Failed to start stream: {e}")
+            return False
+    
+    def _start_regular_stream(self, stream_name: str, settings: Dict[str, Any]) -> bool:
+        """Start regular streaming"""
+        try:
             graphics_view = self._graphics_views[stream_name]
             
             worker = StreamCaptureWorker(stream_name, graphics_view, settings)
@@ -577,7 +605,40 @@ class NewStreamManager(QObject):
             return True
             
         except Exception as e:
-            self.stream_error.emit(stream_name, f"Failed to start stream: {e}")
+            self.stream_error.emit(stream_name, f"Failed to start regular stream: {e}")
+            return False
+    
+    def _start_hdmi_stream(self, stream_name: str, settings: Dict[str, Any]) -> bool:
+        """Start HDMI streaming"""
+        try:
+            from hdmi_stream_manager import HDMIStreamManager
+            
+            graphics_view = self._graphics_views[stream_name]
+            
+            # Create HDMI stream manager
+            hdmi_manager = HDMIStreamManager()
+            
+            # Configure HDMI stream first
+            hdmi_stream_name = f"hdmi_{stream_name}"
+            if not hdmi_manager.configure_hdmi_stream(hdmi_stream_name, settings):
+                self.stream_error.emit(stream_name, "Failed to configure HDMI stream")
+                return False
+            
+            # Start HDMI streaming
+            success = hdmi_manager.start_hdmi_stream(hdmi_stream_name, graphics_view)
+            
+            if success:
+                # Store HDMI manager for cleanup
+                self._workers[stream_name] = hdmi_manager
+                self._stream_states[stream_name] = StreamState.RUNNING
+                self._on_stream_started(stream_name)
+                return True
+            else:
+                self.stream_error.emit(stream_name, "Failed to start HDMI stream")
+                return False
+                
+        except Exception as e:
+            self.stream_error.emit(stream_name, f"Failed to start HDMI stream: {e}")
             return False
     
     def stop_stream(self, stream_name: str) -> bool:
@@ -613,10 +674,18 @@ class NewStreamManager(QObject):
         if stream_name in self._workers:
             worker = self._workers[stream_name]
             try:
-                worker.stop_streaming()
-                if not worker.wait(5000):  # Wait 5 seconds
-                    worker.terminate()
-                    worker.wait(2000)  # Wait 2 more seconds
+                # Check if this is an HDMI stream manager
+                if hasattr(worker, 'stop_hdmi_stream'):
+                    # HDMI stream manager - use the hdmi stream name
+                    hdmi_stream_name = f"hdmi_{stream_name}"
+                    worker.stop_hdmi_stream(hdmi_stream_name)
+                else:
+                    # Regular stream worker
+                    worker.stop_streaming()
+                    if hasattr(worker, 'wait'):
+                        if not worker.wait(5000):  # Wait 5 seconds
+                            worker.terminate()
+                            worker.wait(2000)  # Wait 2 more seconds
             except Exception as e:
                 print(f"Error stopping worker for {stream_name}: {e}")
             finally:
@@ -652,8 +721,12 @@ class NewStreamManager(QObject):
         """Periodic health check for streams"""
         for stream_name, worker in list(self._workers.items()):
             try:
-                if not worker.isRunning() and self._stream_states.get(stream_name) == StreamState.RUNNING:
-                    self._on_stream_error(stream_name, "Worker thread died unexpectedly")
+                # Check if this is a regular stream worker (has isRunning method)
+                if hasattr(worker, 'isRunning'):
+                    if not worker.isRunning() and self._stream_states.get(stream_name) == StreamState.RUNNING:
+                        self._on_stream_error(stream_name, "Worker thread died unexpectedly")
+                # For HDMI stream managers, we assume they're running if they're in the workers dict
+                # The HDMI manager will emit signals if there are issues
             except Exception as e:
                 print(f"Health check error for {stream_name}: {e}")
 

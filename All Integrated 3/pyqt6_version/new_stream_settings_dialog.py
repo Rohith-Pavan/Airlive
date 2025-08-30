@@ -339,14 +339,15 @@ class NewStreamSettingsDialog(QDialog):
             "Twitch",
             "YouTube Live",
             "Facebook Live",
-            "Custom SRT"
+            "Custom SRT",
+            "HDMI Display"
         ])
         self.platform_combo.currentTextChanged.connect(self._on_platform_changed)
         dest_layout.addRow("Platform:", self.platform_combo)
         
         # URL
         self.url_edit = QLineEdit()
-        self.url_edit.setPlaceholderText("rtmp://live.twitch.tv/live/")
+        self.url_edit.setPlaceholderText("rtmps://a.rtmps.youtube.com/live2/")
         dest_layout.addRow("Stream URL:", self.url_edit)
         
         # Key
@@ -354,6 +355,21 @@ class NewStreamSettingsDialog(QDialog):
         self.key_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.key_edit.setPlaceholderText("Your stream key")
         dest_layout.addRow("Stream Key:", self.key_edit)
+        
+        # HDMI Display selection (initially hidden)
+        self.hdmi_display_combo = QComboBox()
+        self.hdmi_display_label = QLabel("HDMI Display:")
+        dest_layout.addRow(self.hdmi_display_label, self.hdmi_display_combo)
+        self.hdmi_display_combo.setVisible(False)
+        self.hdmi_display_label.setVisible(False)
+        
+        # HDMI Mode selection (initially hidden)
+        self.hdmi_mode_combo = QComboBox()
+        self.hdmi_mode_combo.addItems(["Mirror", "Extend", "Fullscreen"])
+        self.hdmi_mode_label = QLabel("HDMI Mode:")
+        dest_layout.addRow(self.hdmi_mode_label, self.hdmi_mode_combo)
+        self.hdmi_mode_combo.setVisible(False)
+        self.hdmi_mode_label.setVisible(False)
         
         # Show key checkbox
         self.show_key_check = QCheckBox("Show stream key")
@@ -376,15 +392,15 @@ class NewStreamSettingsDialog(QDialog):
         ])
         video_layout.addRow("Resolution:", self.resolution_combo)
         
-        # FPS
+        # FPS - ENHANCED: 60 FPS as default for maximum smoothness
         self.fps_combo = QComboBox()
-        self.fps_combo.addItems(["30", "60", "25", "24"])
+        self.fps_combo.addItems(["60", "30", "25", "24"])  # 60 FPS first for HDMI quality
         video_layout.addRow("Frame Rate:", self.fps_combo)
         
-        # Video bitrate
+        # Video bitrate - ENHANCED: Higher default for maximum quality
         self.video_bitrate_spin = QSpinBox()
         self.video_bitrate_spin.setRange(100, 50000)
-        self.video_bitrate_spin.setValue(2500)
+        self.video_bitrate_spin.setValue(8000)  # ENHANCED: 8 Mbps for high quality
         self.video_bitrate_spin.setSuffix(" kbps")
         video_layout.addRow("Video Bitrate:", self.video_bitrate_spin)
         
@@ -485,7 +501,7 @@ class NewStreamSettingsDialog(QDialog):
             }),
             ("YouTube 720p30", {
                 "platform": "YouTube Live",
-                "url": "rtmp://a.rtmp.youtube.com/live2/",
+                "url": "rtmps://a.rtmps.youtube.com/live2/",
                 "resolution": "1280x720",
                 "fps": 30,
                 "video_bitrate": 2500
@@ -511,14 +527,58 @@ class NewStreamSettingsDialog(QDialog):
         """Handle platform change"""
         platform_urls = {
             "Twitch": "rtmp://live.twitch.tv/live/",
-            "YouTube Live": "rtmp://a.rtmp.youtube.com/live2/",
+            "YouTube Live": "rtmps://a.rtmps.youtube.com/live2/",
             "Facebook Live": "rtmps://live-api-s.facebook.com:443/rtmp/",
             "Custom SRT": "srt://",
             "Custom RTMP": ""
         }
         
-        if platform in platform_urls:
-            self.url_edit.setText(platform_urls[platform])
+        # Handle HDMI Display platform
+        if platform == "HDMI Display":
+            self._setup_hdmi_display()
+            # Hide URL and Key fields for HDMI
+            self.url_edit.setVisible(False)
+            self.key_edit.setVisible(False)
+            self.show_key_check.setVisible(False)
+            # Show HDMI specific fields
+            self.hdmi_display_combo.setVisible(True)
+            self.hdmi_display_label.setVisible(True)
+            self.hdmi_mode_combo.setVisible(True)
+            self.hdmi_mode_label.setVisible(True)
+        else:
+            # Show URL and Key fields for streaming platforms
+            self.url_edit.setVisible(True)
+            self.key_edit.setVisible(True)
+            self.show_key_check.setVisible(True)
+            # Hide HDMI specific fields
+            self.hdmi_display_combo.setVisible(False)
+            self.hdmi_display_label.setVisible(False)
+            self.hdmi_mode_combo.setVisible(False)
+            self.hdmi_mode_label.setVisible(False)
+            
+            if platform in platform_urls:
+                self.url_edit.setText(platform_urls[platform])
+    
+    def _setup_hdmi_display(self):
+        """Setup HDMI display options"""
+        try:
+            from display_manager import DisplayManager
+            
+            display_manager = DisplayManager()
+            displays = display_manager.get_displays()
+            
+            self.hdmi_display_combo.clear()
+            if displays:
+                for display in displays:
+                    display_name = display.display_name
+                    self.hdmi_display_combo.addItem(display_name, display.index)
+            else:
+                self.hdmi_display_combo.addItem("No displays found", -1)
+                
+        except Exception as e:
+            print(f"Error setting up HDMI displays: {e}")
+            self.hdmi_display_combo.clear()
+            self.hdmi_display_combo.addItem("Error detecting displays", -1)
     
     def _toggle_key_visibility(self, show: bool):
         """Toggle stream key visibility"""
@@ -595,7 +655,7 @@ class NewStreamSettingsDialog(QDialog):
     
     def _get_current_settings(self) -> Dict[str, Any]:
         """Get current settings from UI"""
-        return {
+        settings = {
             "platform": self.platform_combo.currentText(),
             "url": self.url_edit.text().strip(),
             "key": self.key_edit.text().strip(),
@@ -609,6 +669,18 @@ class NewStreamSettingsDialog(QDialog):
             "low_latency": self.low_latency_check.isChecked(),
             "buffer_size": self.buffer_size_spin.value()
         }
+        
+        # Add HDMI specific settings if HDMI platform is selected
+        if self.platform_combo.currentText() == "HDMI Display":
+            settings.update({
+                "hdmi_display_index": self.hdmi_display_combo.currentData(),
+                "hdmi_mode": self.hdmi_mode_combo.currentText(),
+                "is_hdmi": True
+            })
+        else:
+            settings["is_hdmi"] = False
+            
+        return settings
     
     def _update_ui_from_settings(self):
         """Update UI from current settings"""
@@ -620,6 +692,21 @@ class NewStreamSettingsDialog(QDialog):
         # URL and Key
         self.url_edit.setText(self.settings.get("url", ""))
         self.key_edit.setText(self.settings.get("key", ""))
+        
+        # HDMI specific settings
+        if self.settings.get("is_hdmi", False):
+            # Set HDMI display if saved
+            hdmi_index = self.settings.get("hdmi_display_index", -1)
+            for i in range(self.hdmi_display_combo.count()):
+                if self.hdmi_display_combo.itemData(i) == hdmi_index:
+                    self.hdmi_display_combo.setCurrentIndex(i)
+                    break
+            
+            # Set HDMI mode
+            hdmi_mode = self.settings.get("hdmi_mode", "Mirror")
+            index = self.hdmi_mode_combo.findText(hdmi_mode)
+            if index >= 0:
+                self.hdmi_mode_combo.setCurrentIndex(index)
         
         # Resolution
         index = self.resolution_combo.findText(self.settings.get("resolution", "1920x1080"))
@@ -661,10 +748,15 @@ class NewStreamSettingsDialog(QDialog):
         
         settings = self._get_current_settings()
         
-        # Validate
-        if not settings.get('url') or not settings.get('key'):
-            QMessageBox.warning(self, "Error", "URL and Stream Key are required")
-            return
+        # Validate based on platform
+        if settings.get("platform") == "HDMI Display":
+            if settings.get("hdmi_display_index", -1) == -1:
+                QMessageBox.warning(self, "Error", "Please select a valid HDMI display")
+                return
+        else:
+            if not settings.get('url') or not settings.get('key'):
+                QMessageBox.warning(self, "Error", "URL and Stream Key are required")
+                return
         
         # Configure and start
         self.stream_manager.configure_stream(self.stream_name, settings)
@@ -699,14 +791,21 @@ class NewStreamSettingsDialog(QDialog):
         """Save settings"""
         settings = self._get_current_settings()
         
-        # Validate required fields
-        if not settings.get('url'):
-            QMessageBox.warning(self, "Error", "Stream URL is required")
-            return
-        
-        if not settings.get('key'):
-            QMessageBox.warning(self, "Error", "Stream Key is required")
-            return
+        # Validate required fields based on platform
+        if settings.get("platform") == "HDMI Display":
+            # For HDMI, validate display selection
+            if settings.get("hdmi_display_index", -1) == -1:
+                QMessageBox.warning(self, "Error", "Please select a valid HDMI display")
+                return
+        else:
+            # For streaming platforms, validate URL and key
+            if not settings.get('url'):
+                QMessageBox.warning(self, "Error", "Stream URL is required")
+                return
+            
+            if not settings.get('key'):
+                QMessageBox.warning(self, "Error", "Stream Key is required")
+                return
         
         # Save to file
         self._save_settings_to_file(settings)
@@ -717,20 +816,23 @@ class NewStreamSettingsDialog(QDialog):
         self.accept()
     
     def _load_default_settings(self) -> Dict[str, Any]:
-        """Load default settings"""
+        """Load default settings - ENHANCED FOR MAXIMUM QUALITY"""
         return {
             "platform": "Custom RTMP",
             "url": "",
             "key": "",
-            "resolution": "1920x1080",
-            "fps": 30,
-            "video_bitrate": 2500,
-            "audio_bitrate": 128,
+            "resolution": "1920x1080",  # Full HD default
+            "fps": 60,  # ENHANCED: 60 FPS for ultra-smooth playback
+            "video_bitrate": 8000,  # ENHANCED: Higher bitrate for maximum quality
+            "audio_bitrate": 192,  # ENHANCED: Higher audio quality
             "codec": "libx264",
-            "preset": "veryfast",
-            "profile": "main",
+            "preset": "medium",  # ENHANCED: Better quality preset
+            "profile": "high",  # ENHANCED: High profile for better quality
             "low_latency": False,
-            "buffer_size": 2
+            "buffer_size": 2,
+            "is_hdmi": False,
+            "hdmi_display_index": -1,
+            "hdmi_mode": "Mirror"
         }
     
     def _load_saved_settings(self):

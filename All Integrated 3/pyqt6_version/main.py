@@ -5,19 +5,60 @@ Loads and displays the original Qt Designer UI with video source selection funct
 """
     
 import sys
+import os
 from pathlib import Path
 from PyQt6 import uic, QtGui
-from PyQt6.QtWidgets import QApplication, QLabel, QWidget
-from PyQt6.QtCore import Qt, QSize, QTimer, QDateTime
+from PyQt6.QtCore import (QCoreApplication, QDateTime, QEvent, QObject, QPoint, QPointF, QRectF, QSize, QSettings, Qt, QTimer, pyqtSignal)
+from PyQt6.QtWidgets import QApplication, QLabel, QWidget, QMessageBox, QSizePolicy
 from PyQt6.QtMultimedia import QCamera, QMediaCaptureSession, QMediaPlayer, QAudioOutput, QVideoSink, QVideoFrame
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 from video_source_dialog import VideoSourceDialog
 from media_file_dialog import MediaFileDialog
 from effects_manager import EffectsManager
 from graphics_output_widget import GraphicsOutputManager, preanalyze_effects_folder
-from gstreamer.gst_stream_manager import NewStreamManager, NewStreamControlWidget
-from gstreamer.audio_compositor import AudioCompositor
-from gstreamer.recording_manager import RecordingManager
+from hdmi_stream_manager import get_hdmi_stream_manager
+# Try GStreamer first, fall back to our working stream manager
+try:
+    from gstreamer.gst_stream_manager import (
+        NewStreamManager,
+        NewStreamControlWidget,
+        GstMediaRtmpStreamer,
+        build_media_rtmp_pipeline,
+        build_media_preview_pipeline,
+    )
+    USING_GSTREAMER = True
+except ImportError as e:
+    print(f"GStreamer not available ({e}), using fallback stream manager")
+    from new_stream_manager import NewStreamManager, NewStreamControlWidget
+    USING_GSTREAMER = False
+
+# Conditional GStreamer imports
+if USING_GSTREAMER:
+    from gstreamer.audio_compositor import AudioCompositor
+    from gstreamer.recording_manager import RecordingManager
+else:
+    # Fallback classes for when GStreamer is not available
+    class AudioCompositor:
+        def __init__(self):
+            pass
+        def start(self):
+            pass
+        def stop(self):
+            pass
+        def cleanup(self):
+            pass
+    
+    class RecordingManager:
+        def __init__(self):
+            pass
+        def start_recording(self, *args, **kwargs):
+            return False
+        def stop_recording(self):
+            pass
+        def cleanup(self):
+            pass
+
+from recording_settings_dialog import RecordingSettingsDialog
 
 
 
@@ -89,6 +130,8 @@ class VideoInputManager:
         # Track which logical sources are currently present inside AudioCompositor
         # to avoid redundant add/remove (which spams pad-added and rebuilds decodebins)
         self._ac_present_sources = set()
+        # Track currently active audible logical source to avoid touching all sources on switch
+        self._active_audio_name = None
 
         # Icon paths for toggling (fallback when UI doesn't auto-toggle)
         try:
@@ -113,6 +156,19 @@ class VideoInputManager:
             self._qvideosink.videoFrameChanged.connect(self._on_sink_frame)
         except Exception as e:
             print(f"Warning: QVideoSink not available or failed to initialize: {e}")
+            self._qvideosink = None
+        # Streaming handoff state
+        self.stream_manager = None  # type: ignore
+        self._media_streamers = {}  # stream_name -> GstMediaRtmpStreamer
+        self._last_active_streams = []  # preserve to restart scene streams on input switch
+        # Preview-only pipeline when not streaming
+        self._preview_streamer = None  # type: ignore
+        # Remember last playback position per media in nanoseconds
+        self._media_positions_ns = {
+            'media1': 0,
+            'media2': 0,
+            'media3': 0,
+        }
         
     def setup_input_widgets(self):
         """Setup video widgets for each input"""
@@ -203,9 +259,36 @@ class VideoInputManager:
                     layout.addWidget(video_widget)
                     self.media_widgets[media_name] = video_widget
                     
-                    # Create media player and connect to video widget
+                    # Create media player with ENHANCED QUALITY settings
                     player = QMediaPlayer()
+                    
+                    # QUALITY ENHANCEMENT: Set high-quality audio output
+                    audio_output = QAudioOutput()
+                    # Set high-quality audio settings
+                    try:
+                        # Enable high-quality audio processing
+                        audio_output.setVolume(1.0)  # Full volume for quality
+                        player.setAudioOutput(audio_output)
+                        self.media_audio_outputs[media_name] = audio_output
+                        print(f"✅ High-quality audio output configured for {media_name}")
+                    except Exception as e:
+                        print(f"Could not configure audio output for {media_name}: {e}")
+                    
+                    # Connect to video widget with quality settings
                     player.setVideoOutput(video_widget)
+                    
+                    # QUALITY ENHANCEMENT: Configure video widget for maximum quality
+                    try:
+                        video_widget.setAspectRatioMode(Qt.AspectRatioMode.KeepAspectRatio)
+                        # Enable high-quality scaling
+                        video_widget.setSizePolicy(
+                            QSizePolicy.Policy.Expanding, 
+                            QSizePolicy.Policy.Expanding
+                        )
+                        print(f"✅ High-quality video settings applied to {media_name}")
+                    except Exception as e:
+                        print(f"Could not apply video quality settings to {media_name}: {e}")
+                    
                     self.media_players[media_name] = player
                     
                     print(f"Media widget {media_name} setup complete")
@@ -373,9 +456,8 @@ class VideoInputManager:
             # Apply immediately only if the toggled source is currently active in output
             if self.current_output_source == (source_type, source_name):
                 if source_type == 'media':
-                    # Control media volume via AudioCompositor for active media
+                    # Control media mute via AudioCompositor for active media
                     if getattr(self, 'audio_compositor', None):
-                        vol = 0.0 if (new_state or self.master_muted) else 1.0
                         try:
                             # Ensure source exists in AC
                             if self.media_files.get(source_name) and source_name not in self._ac_present_sources:
@@ -383,9 +465,10 @@ class VideoInputManager:
                                 self._ac_present_sources.add(source_name)
                         except Exception:
                             pass
-                        self.audio_compositor.set_input_volume(source_name, vol)
+                        # Mute immediately if per-source or master is muted
+                        self.audio_compositor.set_input_muted(source_name, bool(new_state or self.master_muted))
                 else:
-                    # Control mic volume via audio compositor for active input
+                    # Control mic mute via audio compositor for active input
                     self._apply_per_input_mute(source_type, source_name, new_state)
             print(f"{'Muted' if new_state else 'Unmuted'} {source_name}")
         except Exception as e:
@@ -444,13 +527,135 @@ class VideoInputManager:
     # --- Integration hooks (no-ops for now; to be wired to GStreamer when ready) ---
     def _apply_per_input_mute(self, source_type: str, source_name: str, muted: bool):
         try:
-            # If an audio compositor is available, set volume for the logical input
+            # If an audio compositor is available, toggle mute for the logical input
             if getattr(self, 'audio_compositor', None):
-                vol = 0.0 if muted else 1.0
                 # Map directly by logical name; compositor is expected to have sources with same names
-                self.audio_compositor.set_input_volume(source_name, vol)
+                self.audio_compositor.set_input_muted(source_name, bool(muted))
         except Exception as e:
             print(f"Warning: Failed applying mute to {source_name}: {e}")
+
+    def _apply_audio_for_active_source(self, source_type: str, source_name: str) -> None:
+        """Route audio in AudioCompositor so only the active source is audible.
+
+        - Ensures the active logical source exists in `AudioCompositor`.
+        - Keeps only the active logical source's audio path present; removes others to avoid bleed.
+        - Sets the active source unmuted (unless per-source or master mute applies).
+        """
+        try:
+            ac = getattr(self, 'audio_compositor', None)
+            if not ac:
+                return
+
+            # Helper to ensure presence in AC
+            def ensure_ac_source(name: str, stype: str):
+                try:
+                    if name in self._ac_present_sources:
+                        return
+                    if stype == 'input':
+                        ac.add_auto_source(name)
+                        self._ac_present_sources.add(name)
+                    elif stype == 'media':
+                        fpath = self.media_files.get(name)
+                        if fpath:
+                            ac.add_media_file_source(name, fpath)
+                            self._ac_present_sources.add(name)
+                except Exception as e:
+                    print(f"Warning: ensure_ac_source failed for {name}: {e}")
+
+            # Before adding/activating, remove conflicting categories to prevent background audio
+            try:
+                # If switching to media, remove all other media sources from AC
+                if source_type == 'media':
+                    for n in list(self._ac_present_sources):
+                        if n.startswith('media') and n != source_name:
+                            try:
+                                ac.remove_source(n)
+                            except Exception:
+                                pass
+                            self._ac_present_sources.discard(n)
+                # If switching to input, remove all media sources from AC
+                else:
+                    for n in list(self._ac_present_sources):
+                        if n.startswith('media'):
+                            try:
+                                ac.remove_source(n)
+                            except Exception:
+                                pass
+                            self._ac_present_sources.discard(n)
+            except Exception as e:
+                print(f"Warning: failed pruning AC sources: {e}")
+
+            # Ensure active source exists in AC (after pruning)
+            ensure_ac_source(source_name, source_type)
+
+            # Calculate target mute states
+            def target_muted(name: str) -> bool:
+                # Respect master mute and per-source mute
+                if self.master_muted:
+                    return True
+                if self.muted_inputs.get(name, False):
+                    return True
+                return False
+
+            # Quickly switch by only touching previous active and new active
+            prev = getattr(self, '_active_audio_name', None)
+            if prev and prev != source_name:
+                try:
+                    # Remove previous media audio entirely to ensure no residual playback
+                    if prev.startswith('media') and source_type == 'media':
+                        try:
+                            ac.remove_source(prev)
+                        except Exception:
+                            pass
+                        self._ac_present_sources.discard(prev)
+                    else:
+                        ac.set_input_muted(prev, True)
+                except Exception:
+                    pass
+            # Set current active mute state
+            try:
+                ac.set_input_muted(source_name, target_muted(source_name))
+            except Exception as e:
+                print(f"Warning: failed to set mute for active {source_name}: {e}")
+            self._active_audio_name = source_name
+
+        except Exception as e:
+            print(f"Warning: _apply_audio_for_active_source error: {e}")
+
+    def _silence_audio_compositor_for_media_monitor(self):
+        """Mute all AudioCompositor inputs so only media pipeline monitor audio is heard."""
+        ac = getattr(self, 'audio_compositor', None)
+        if not ac:
+            return
+        try:
+            for nm in ['input1','input2','input3','media1','media2','media3']:
+                try:
+                    ac.set_input_muted(nm, True)
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"Warning: failed to mute AudioCompositor inputs: {e}")
+
+    def _snapshot_media_position(self, media_name: str):
+        """Capture current playback position (ns) for the given media from active pipelines."""
+        pos = None
+        try:
+            if getattr(self, '_preview_streamer', None):
+                pos = self._preview_streamer.get_position_ns()
+            elif getattr(self, '_media_streamers', None):
+                # any one of the streamers carries the same media position
+                try:
+                    any_streamer = next(iter(self._media_streamers.values()))
+                    pos = any_streamer.get_position_ns()
+                except Exception:
+                    pos = None
+        except Exception:
+            pos = None
+        if isinstance(pos, int) and pos > 0:
+            try:
+                self._media_positions_ns[media_name] = int(pos)
+            except Exception:
+                pass
 
     def _apply_master_mute(self, muted: bool):
         try:
@@ -491,7 +696,7 @@ class VideoInputManager:
             self.input_cameras[input_name] = camera
             self.input_sources[input_name] = camera_device
             
-            # Use camera's default format to preserve original resolution
+            # ENHANCED: Select highest quality format available
             try:
                 formats = camera_device.videoFormats()
                 if formats:
@@ -500,6 +705,39 @@ class VideoInputManager:
                     for fmt in formats[:5]:  # Show first 5 formats
                         sz = fmt.resolution()
                         print(f"  {sz.width()}x{sz.height()}")
+                    
+                    # QUALITY ENHANCEMENT: Select best format
+                    best_format = None
+                    best_score = 0
+                    
+                    for fmt in formats:
+                        sz = fmt.resolution()
+                        width, height = sz.width(), sz.height()
+                        
+                        # Calculate quality score (resolution * frame rate)
+                        fps = fmt.maxFrameRate()
+                        score = width * height * fps
+                        
+                        # Prefer common high-quality resolutions
+                        if width >= 1280 and height >= 720:  # HD or better
+                            score *= 2  # Bonus for HD+
+                        if width >= 1920 and height >= 1080:  # Full HD
+                            score *= 1.5  # Extra bonus for Full HD
+                        
+                        if score > best_score:
+                            best_score = score
+                            best_format = fmt
+                    
+                    # Apply best format if found
+                    if best_format:
+                        try:
+                            camera.setCameraFormat(best_format)
+                            sz = best_format.resolution()
+                            fps = best_format.maxFrameRate()
+                            print(f"✅ Set {input_name} to MAXIMUM QUALITY: {sz.width()}x{sz.height()} @ {fps}fps")
+                        except Exception as e:
+                            print(f"Could not set camera format for {input_name}: {e}")
+                    
             except Exception as e:
                 print(f"Could not list camera formats for {input_name}: {e}")
 
@@ -564,6 +802,13 @@ class VideoInputManager:
                 print(f"Connected media player to video widget for {media_name}")
             else:
                 print(f"Warning: No video widget found for {media_name}")
+            
+            # AUDIO SYNC ENHANCEMENT: Create audio output with 0 volume for preview
+            audio_output = QAudioOutput()
+            audio_output.setVolume(0.0)  # Start with 0 volume for synchronized preview
+            player.setAudioOutput(audio_output)
+            self.media_audio_outputs[media_name] = audio_output
+            print(f"✅ Audio sync setup: {media_name} starts with 0 volume for preview")
             
             self.media_players[media_name] = player
                 
@@ -635,6 +880,11 @@ class VideoInputManager:
             self._clear_current_output()
             
             if source_type == 'input':
+                # If media pipelines were active, stop them and restart scene streams
+                try:
+                    self._stop_media_streamers(restart_scene_streams=True)
+                except Exception as _e:
+                    print(f"Warning: failed stopping media streamers on input switch: {_e}")
                 # Switch camera input to output
                 if source_name in self.input_cameras and self.input_cameras[source_name]:
                     camera = self.input_cameras[source_name]
@@ -678,24 +928,176 @@ class VideoInputManager:
                         print(f"Error: Invalid output widget for {source_name}")
                         return
 
-                    # Set media player output to main preview
+                    # By default, render using internal video rendering
                     player.setVideoOutput(self.output_preview_widget)
-                    # Do not attach a QAudioOutput; audio will be handled by AudioCompositor
+                    
+                    # AUDIO SYNC ENHANCEMENT: Increase volume when media is selected for output
+                    self._set_media_audio_volume(source_name, 1.0)  # Full volume for output
+                    
+                    # If streaming is active on any streams, hand off to combined media pipeline for A/V sync
+                    uri_path = self.media_files.get(source_name)
+                    active_streams = []
+                    try:
+                        if self.stream_manager:
+                            active_streams = list(self.stream_manager.get_active_streams())
+                    except Exception as e:
+                        print(f"Warning: Failed to query active streams: {e}")
 
-                    # Play the media if it has a source
-                    if self.media_files[source_name]:
-                        player.play()
+                    # If currently streaming via media pipelines, stop them to switch media
+                    if self._media_streamers:
+                        # snapshot position from any active media streamer before stopping
+                        try:
+                            self._snapshot_media_position(source_name)
+                        finally:
+                            self._stop_media_streamers(restart_scene_streams=False)
+                        # Use previously active streams list for restarting media pipelines
+                        if not active_streams and self._last_active_streams:
+                            active_streams = self._last_active_streams[:]
+
+                    if uri_path and active_streams:
+                        # Stop scene-based streams first and remember which to restart later
+                        self._last_active_streams = active_streams[:]
+                        for s in active_streams:
+                            try:
+                                self.stream_manager.stop_stream(s)
+                            except Exception as e:
+                                print(f"Warning: Failed stopping scene stream {s}: {e}")
+
+                        # Start one media pipeline per active stream (supports Stream1 & Stream2)
+                        # Convert file path to file:// URI to avoid parse errors
+                        try:
+                            from pathlib import Path as _Path
+                            media_uri = _Path(uri_path).resolve().as_uri()
+                        except Exception:
+                            media_uri = uri_path
+                        for s in active_streams:
+                            try:
+                                cfg = self.stream_manager.get_stream_config(s) if self.stream_manager else None
+                                if not cfg:
+                                    print(f"Warning: No config for {s}; skipping media pipeline")
+                                    continue
+                                width, height = map(int, str(cfg['resolution']).split('x'))
+                                fps = int(cfg['fps'])
+                                vkbps = int(cfg['video_bitrate'])
+                                akbps = int(cfg.get('audio_bitrate', 128))
+                                url = str(cfg['url']).rstrip('/')
+                                key = str(cfg.get('key', ''))
+                                target = f"{url}/{key}" if key else url
+                                from pathlib import Path as _P
+                                media_uri = _P(uri_path).resolve().as_uri()
+
+                                pipeline_desc = build_media_rtmp_pipeline(media_uri, width, height, fps, target, vkbps, akbps)
+
+                                def _deliver_preview(qimg, _self=self):
+                                    # marshal to UI thread
+                                    try:
+                                        QTimer.singleShot(0, lambda img=qimg: hasattr(_self.output_preview_widget, 'set_qimage_frame') and _self.output_preview_widget.set_qimage_frame(img))
+                                    except Exception as _e:
+                                        print(f"Preview delivery error: {_e}")
+
+                                streamer = GstMediaRtmpStreamer(pipeline_desc, _deliver_preview)
+                                streamer.start()
+                                # seek to last saved position if available
+                                try:
+                                    last_pos = int(self._media_positions_ns.get(source_name, 0) or 0)
+                                    if last_pos > 0:
+                                        streamer.pause()
+                                        streamer.seek_ns(last_pos)
+                                        streamer.play()
+                                except Exception:
+                                    pass
+                                self._media_streamers[s] = streamer
+                            except Exception as e:
+                                print(f"Error starting media pipeline for {s}: {e}")
+
+                        # Ensure internal renderer is cleared; preview will arrive via QImage from media pipeline
+                        try:
+                            if hasattr(self.output_preview_widget, 'set_qimage_frame'):
+                                self.output_preview_widget.set_qimage_frame(None)
+                        except Exception:
+                            pass
+                        # Silence AudioCompositor to avoid double monitor audio; monitor comes from media pipeline now
+                        try:
+                            self._silence_audio_compositor_for_media_monitor()
+                        except Exception as _e:
+                            print(f"Warning: failed silencing AudioCompositor during media monitor: {_e}")
+                    else:
+                        # No active streaming; play preview using a low-latency A/V-synced GStreamer pipeline
+                        if uri_path:
+                            # Stop any existing preview streamer
+                            try:
+                                if self._preview_streamer:
+                                    # snapshot current preview position before stopping
+                                    try:
+                                        self._snapshot_media_position(source_name)
+                                    except Exception:
+                                        pass
+                                    self._preview_streamer.stop()
+                                    self._preview_streamer = None
+                            except Exception:
+                                self._preview_streamer = None
+
+                            # Determine preview size and fps
+                            try:
+                                width = int(getattr(self.output_preview_widget, 'width', lambda: 1280)())
+                                height = int(getattr(self.output_preview_widget, 'height', lambda: 720)())
+                                if width <= 0 or height <= 0:
+                                    width, height = 1280, 720
+                            except Exception:
+                                width, height = 1280, 720
+                            fps = 30
+
+                            # Build preview pipeline and start
+                            # Convert file path to file:// URI for GStreamer
+                            try:
+                                from pathlib import Path as _Path
+                                media_uri = _Path(uri_path).resolve().as_uri()
+                            except Exception:
+                                media_uri = uri_path
+                            pipeline_desc = build_media_preview_pipeline(media_uri, width, height, fps)
+
+                            def _deliver_preview(sample_qimg):
+                                img = sample_qimg
+                                _self = self
+                                try:
+                                    QTimer.singleShot(0, lambda img=img: hasattr(_self.output_preview_widget, 'set_qimage_frame') and _self.output_preview_widget.set_qimage_frame(img))
+                                except Exception as _e:
+                                    print(f"Preview delivery error: {_e}")
+
+                            try:
+                                preview_streamer = GstMediaRtmpStreamer(pipeline_desc, _deliver_preview)
+                                preview_streamer.start()
+                                # seek to last saved position if available
+                                try:
+                                    last_pos = int(self._media_positions_ns.get(source_name, 0) or 0)
+                                    if last_pos > 0:
+                                        preview_streamer.pause()
+                                        preview_streamer.seek_ns(last_pos)
+                                        preview_streamer.play()
+                                except Exception:
+                                    pass
+                                self._preview_streamer = preview_streamer
+                            except Exception as e:
+                                print(f"Error starting preview pipeline: {e}")
+
+                            # Silence AudioCompositor; monitor audio comes from preview pipeline
+                            try:
+                                self._silence_audio_compositor_for_media_monitor()
+                            except Exception as _e:
+                                print(f"Warning: failed silencing AudioCompositor during preview: {_e}")
 
                     self.current_output_source = (source_type, source_name)
                     print(f"Switched output to {source_name} media")
-                    # Ensure graphics item uses its internal video rendering (clear any external qimage)
-                    try:
-                        if hasattr(self.output_preview_widget, 'set_qimage_frame'):
-                            self.output_preview_widget.set_qimage_frame(None)
-                    except Exception:
-                        pass
-                    # Update audio routing: enable only this media's audio in AudioCompositor; disable all mics and other media
-                    self._apply_audio_for_active_source('media', source_name)
+                    # AUDIO SYNC FIX: Don't use AudioCompositor for media - we have direct QAudioOutput control
+                    # This prevents duplicate audio streams
+                    if not active_streams:
+                        # Remove all media from AudioCompositor to prevent duplicate audio
+                        self._remove_all_media_from_audio_compositor()
+                        # Ensure all other media is muted
+                        self._mute_all_media_audio()
+                        # Then unmute only the active media
+                        self._set_media_audio_volume(source_name, 1.0)
+                        print(f"✅ Audio sync: Using direct audio control, AudioCompositor bypassed")
                 else:
                     print(f"No media file assigned to {source_name}. Please select a media file first.")
 
@@ -705,6 +1107,23 @@ class VideoInputManager:
     def _clear_current_output(self):
         """Clear current output connections to prevent conflicts"""
         try:
+            # Snapshot position for current media before tearing down
+            try:
+                if self.current_output_source and self.current_output_source[0] == 'media':
+                    self._snapshot_media_position(self.current_output_source[1])
+                    
+                    # AUDIO SYNC FIX: Remove media from AudioCompositor to prevent duplicate audio
+                    media_name = self.current_output_source[1]
+                    if hasattr(self, 'audio_compositor') and self.audio_compositor:
+                        try:
+                            if media_name in self._ac_present_sources:
+                                self.audio_compositor.remove_source(media_name)
+                                self._ac_present_sources.discard(media_name)
+                                print(f"✅ Removed {media_name} from AudioCompositor to prevent duplicate audio")
+                        except Exception as e:
+                            print(f"Warning: Could not remove {media_name} from AudioCompositor: {e}")
+            except Exception:
+                pass
             # Clear all camera sessions from output
             for session in self.input_sessions.values():
                 if session and hasattr(session, 'videoOutput'):
@@ -712,90 +1131,170 @@ class VideoInputManager:
                     if vo is not None and (vo == self.output_preview_widget or vo == self._qvideosink):
                         session.setVideoOutput(None)
 
-            # Clear all media players from output
-            for player in self.media_players.values():
+            # Clear all media players from output and mute their audio
+            for media_name, player in self.media_players.items():
                 if player and hasattr(player, 'videoOutput') and player.videoOutput() == self.output_preview_widget:
                     player.setVideoOutput(None)
+                    
+                    # AUDIO SYNC ENHANCEMENT: Mute audio when media is no longer active
+                    self._set_media_audio_volume(media_name, 0.0)  # Mute for preview
         except Exception as e:
-            print(f"Error clearing output connections: {e}")
-
-    def _on_sink_frame(self, frame: QVideoFrame):
-        """Handle frames from QVideoSink and forward to graphics video item as QImage."""
+            print(f"Error clearing output: {e}")
+    
+    def _set_media_audio_volume(self, media_name, volume):
+        """Set audio volume for a specific media player (0.0 = muted, 1.0 = full)"""
         try:
-            if not self.output_preview_widget:
-                return
-            # Convert frame to QImage (Qt 6 provides toImage())
-            try:
-                img = frame.toImage()
-            except Exception as e:
-                print(f"Failed to convert QVideoFrame to QImage: {e}")
-                return
-            if img is None or img.isNull():
-                return
-            if hasattr(self.output_preview_widget, 'set_qimage_frame'):
-                self.output_preview_widget.set_qimage_frame(img)
+            if media_name in self.media_audio_outputs:
+                audio_output = self.media_audio_outputs[media_name]
+                audio_output.setVolume(volume)
+                status = "muted" if volume == 0.0 else f"{int(volume * 100)}%"
+                print(f"✅ Audio sync: {media_name} volume set to {status}")
+                return True
+            else:
+                print(f"⚠️ No audio output found for {media_name}")
+                return False
         except Exception as e:
-            print(f"Error handling sink frame: {e}")
-
-    def cleanup_resources(self):
-        """Clean up all resources to prevent memory leaks"""
+            print(f"❌ Error setting audio volume for {media_name}: {e}")
+            return False
+    
+    def _mute_all_media_audio(self):
+        """Mute all media audio for synchronized preview"""
         try:
-            # Clear output connections first
-            self._clear_current_output()
-            
-            # Stop and cleanup all cameras
-            for input_name, camera in list(self.input_cameras.items()):
-                if camera:
+            for media_name in self.media_audio_outputs.keys():
+                self._set_media_audio_volume(media_name, 0.0)
+            print("✅ All media audio muted for synchronized preview")
+        except Exception as e:
+            print(f"❌ Error muting all media audio: {e}")
+    
+    def _remove_all_media_from_audio_compositor(self):
+        """Remove all media sources from AudioCompositor to prevent duplicate audio"""
+        try:
+            if hasattr(self, 'audio_compositor') and self.audio_compositor:
+                media_sources_to_remove = [name for name in self._ac_present_sources if name.startswith('media')]
+                for media_name in media_sources_to_remove:
                     try:
-                        camera.stop()
-                        # Disconnect from session
-                        session = self.input_sessions.get(input_name)
-                        if session:
-                            session.setCamera(None)
-                            session.setVideoOutput(None)
-                        camera.deleteLater()
+                        self.audio_compositor.remove_source(media_name)
+                        self._ac_present_sources.discard(media_name)
+                        print(f"✅ Removed {media_name} from AudioCompositor")
                     except Exception as e:
-                        print(f"Error cleaning up camera {input_name}: {e}")
-                    finally:
-                        self.input_cameras[input_name] = None
+                        print(f"Warning: Could not remove {media_name} from AudioCompositor: {e}")
+                
+                if media_sources_to_remove:
+                    print("✅ All media sources removed from AudioCompositor - using direct audio control")
+        except Exception as e:
+            print(f"❌ Error removing media from AudioCompositor: {e}")
+    
+    def _on_sink_frame(self, frame):
+        """Handle video frames from QVideoSink"""
+        try:
+            if not frame.isValid():
+                return
             
-            # Stop and cleanup all media players
-            for media_name, player in list(self.media_players.items()):
+            # Convert QVideoFrame to QImage
+            image = frame.toImage()
+            if image.isNull():
+                return
+            
+            # Send frame to graphics output widget if available
+            if self.output_preview_widget and hasattr(self.output_preview_widget, 'set_qimage_frame'):
+                self.output_preview_widget.set_qimage_frame(image)
+                
+        except Exception as e:
+            print(f"Error processing video frame: {e}")
+    
+    def _stop_media_streamers(self, restart_scene_streams=True):
+        """Stop all media streamers and optionally restart scene streams"""
+        try:
+            # Stop all media players
+            for player_name, player in self.media_players.items():
                 if player:
                     try:
                         player.stop()
-                        player.setVideoOutput(None)
-                        player.deleteLater()
+                        print(f"Stopped media player: {player_name}")
                     except Exception as e:
-                        print(f"Error cleaning up player {media_name}: {e}")
-                    finally:
-                        self.media_players[media_name] = None
+                        print(f"Error stopping media player {player_name}: {e}")
             
-            # Clear sessions
-            for input_name, session in list(self.input_sessions.items()):
+            # Stop preview streamer if active
+            if hasattr(self, '_preview_streamer') and self._preview_streamer:
+                try:
+                    self._preview_streamer.stop()
+                    self._preview_streamer = None
+                    print("Stopped preview streamer")
+                except Exception as e:
+                    print(f"Error stopping preview streamer: {e}")
+            
+            # Clear audio compositor sources if needed
+            if self.audio_compositor and hasattr(self.audio_compositor, 'remove_source'):
+                for source_name in list(self._ac_present_sources):
+                    try:
+                        self.audio_compositor.remove_source(source_name)
+                        self._ac_present_sources.discard(source_name)
+                    except Exception as e:
+                        print(f"Error removing audio source {source_name}: {e}")
+            
+            print("Media streamers stopped successfully")
+            
+        except Exception as e:
+            print(f"Error stopping media streamers: {e}")
+    
+    def cleanup_resources(self):
+        """Clean up all video input manager resources"""
+        try:
+            print("Cleaning up VideoInputManager resources...")
+            
+            # Stop all media streamers
+            self._stop_media_streamers(restart_scene_streams=False)
+            
+            # Stop and cleanup all cameras
+            for input_name, camera in self.input_cameras.items():
+                if camera:
+                    try:
+                        camera.stop()
+                        print(f"Stopped camera: {input_name}")
+                    except Exception as e:
+                        print(f"Error stopping camera {input_name}: {e}")
+            
+            # Cleanup all camera sessions
+            for input_name, session in self.input_sessions.items():
                 if session:
                     try:
                         session.setCamera(None)
                         session.setVideoOutput(None)
-                        session.deleteLater()
+                        print(f"Cleaned up camera session: {input_name}")
                     except Exception as e:
-                        print(f"Error cleaning up session {input_name}: {e}")
-                    finally:
-                        self.input_sessions[input_name] = None
+                        print(f"Error cleaning up camera session {input_name}: {e}")
             
-            # Clear widgets references
-            for input_name in self.input_widgets:
-                self.input_widgets[input_name] = None
-            for media_name in self.media_widgets:
-                self.media_widgets[media_name] = None
+            # Cleanup all media players
+            for player_name, player in self.media_players.items():
+                if player:
+                    try:
+                        player.stop()
+                        player.setVideoOutput(None)
+                        player.setAudioOutput(None)
+                        print(f"Cleaned up media player: {player_name}")
+                    except Exception as e:
+                        print(f"Error cleaning up media player {player_name}: {e}")
             
-            self.output_preview_widget = None
-            self.current_output_source = None
+            # Clear all references
+            self.input_cameras.clear()
+            self.input_sessions.clear()
+            self.input_widgets.clear()
+            self.media_players.clear()
+            self.media_audio_outputs.clear()
+            self.media_widgets.clear()
             
-            print("Resources cleaned up successfully")
+            # Clear video sink
+            if self._qvideosink:
+                try:
+                    self._qvideosink.deleteLater()
+                    self._qvideosink = None
+                except Exception as e:
+                    print(f"Error cleaning up video sink: {e}")
+            
+            print("VideoInputManager resources cleaned up successfully")
             
         except Exception as e:
-            print(f"Error during resource cleanup: {e}")
+            print(f"Error during VideoInputManager cleanup: {e}")
 
 
 def main():
@@ -840,6 +1339,9 @@ def main():
 
     # Initialize graphics output manager
     graphics_manager = GraphicsOutputManager(window)
+    
+    # Initialize HDMI stream manager
+    hdmi_manager = get_hdmi_stream_manager()
     
     # Replace the output preview with graphics output widget if it exists
     if hasattr(window, 'outputPreview'):
@@ -919,10 +1421,16 @@ def main():
     if graphics_widget:
         stream_manager.register_graphics_view("Stream1", graphics_widget)
         stream_manager.register_graphics_view("Stream2", graphics_widget)
+    # Provide stream manager reference for media handoff (after creation)
+    video_input_manager.stream_manager = stream_manager
         
-    # Create stream control widgets
+    # Create stream control widgets with HDMI support
     stream1_control = NewStreamControlWidget("Stream1", stream_manager, window)
     stream2_control = NewStreamControlWidget("Stream2", stream_manager, window)
+    
+    # Connect HDMI manager to stream controls for integrated HDMI streaming
+    stream1_control.hdmi_manager = hdmi_manager
+    stream2_control.hdmi_manager = hdmi_manager
         
     # Connect both settings and audio buttons to open settings dialog
     window.stream1SettingsBtn.clicked.connect(stream1_control.open_settings_dialog)
@@ -960,6 +1468,61 @@ def main():
     recording_manager = RecordingManager(audio_channel=ac_channel)
     recording_manager.register_graphics_view(graphics_manager.get_output_widget("main_output"))
 
+    def get_recording_settings():
+        """Helper to load raw settings for the dialog."""
+        settings = QSettings("GoLive", "GoLiveApp")
+        return {
+            'destination_folder': settings.value('recording/destination_folder', os.path.join(os.path.expanduser('~'), 'Videos')),
+            'file_name_pattern': settings.value('recording/file_name_pattern', 'GoLive_Recording'),
+            'video_format': settings.value('recording/video_format', 'MP4'),
+            'quality_preset': settings.value('recording/quality_preset', 'High'),
+            'bitrate': settings.value('recording/bitrate', '8000'),
+            'resolution': settings.value('recording/resolution', '1080p'),
+            'frame_rate': settings.value('recording/frame_rate', '30'),
+            'screenshot_format': settings.value('recording/screenshot_format', 'PNG'),
+            'screenshot_location': settings.value('recording/screenshot_location', 'Same as video'),
+            'custom_screenshot_path': settings.value('recording/custom_screenshot_path', '')
+        }
+
+    def get_recording_config_from_settings():
+        """Helper to load and translate recording settings for the manager."""
+        config = get_recording_settings()
+        resolution_map = {'720p': '1280x720', '1080p': '1920x1080', '2K': '2560x1440', '4K': '3840x2160'}
+        quality_map = {'Low': '2000', 'Medium': '4000', 'High': '8000'}
+
+        manager_config = {}
+        manager_config['resolution'] = resolution_map.get(config['resolution'], '1920x1080')
+        manager_config['fps'] = int(config['frame_rate'])
+        
+        if config['quality_preset'] == 'Custom':
+            bitrate_str = config['bitrate'] if config['bitrate'] else '8000' # Default to 8000 if empty
+            manager_config['video_bitrate'] = int(bitrate_str)
+        else:
+            manager_config['video_bitrate'] = int(quality_map.get(config['quality_preset'], '4000'))
+
+        manager_config['audio_bitrate'] = 128 # Hardcoded for now
+        manager_config['video_format'] = config['video_format'].lower()
+
+        now = QDateTime.currentDateTime()
+        date_str = now.toString('yyyy-MM-dd')
+        time_str = now.toString('HH-mm-ss')
+        
+        # Always include timestamp even if pattern doesn't have placeholders
+        pattern = config['file_name_pattern']
+        if '{date}' not in pattern and '{time}' not in pattern:
+            # Add timestamp to prevent overwrites
+            filename = f"{pattern}_{date_str}_{time_str}"
+        else:
+            filename = pattern.replace('{date}', date_str).replace('{time}', time_str)
+        
+        filename += f".{manager_config['video_format']}"
+        manager_config['output_path'] = os.path.join(config['destination_folder'], filename)
+
+        return manager_config
+
+    # Initial configuration
+    recording_manager.configure_recording(get_recording_config_from_settings())
+
     # --- Record Panel UI State & Logic ---
     # Elements
     record_btn = getattr(window, 'recordRedCircle', None)
@@ -969,8 +1532,63 @@ def main():
     status_text = getattr(window, 'recordStatusText', None)
     settings_btn = getattr(window, 'settingsRecordButton', None)
 
+    def open_recording_settings():
+        dialog = RecordingSettingsDialog(window)
+        current_settings = get_recording_settings() # Use the other helper to load current settings
+        dialog.set_settings(current_settings)
+
+        if dialog.exec():
+            new_settings = dialog.get_settings()
+            settings = QSettings("GoLive", "GoLiveApp")
+            for key, value in new_settings.items():
+                if value is not None:
+                    settings.setValue(f'recording/{key}', value)
+            
+            settings.sync()
+            print(f"Recording settings saved and applied: {new_settings}")
+
+            # Immediately re-configure the recording manager if not actively recording
+            if not recording_manager.is_recording():
+                new_manager_config = get_recording_config_from_settings()
+                recording_manager.configure_recording(new_manager_config)
+
+    if settings_btn:
+        settings_btn.clicked.connect(open_recording_settings)
+
     # Access graphics output widget for screenshots
     graphics_widget = graphics_manager.get_output_widget("main_output")
+
+    def take_screenshot():
+        if not graphics_widget:
+            return
+
+        settings = QSettings("GoLive", "GoLiveApp")
+        custom_dir = settings.value("recording/custom_screenshot_path", "")
+        video_dir = settings.value("recording/destination_folder", os.path.join(os.path.expanduser('~'), 'Videos'))
+        ss_format = settings.value("recording/screenshot_format", "PNG").lower()
+
+        # Prefer explicit screenshot folder if provided; otherwise use recording destination
+        save_dir = custom_dir if (custom_dir and os.path.isdir(custom_dir)) else video_dir
+        if not save_dir or not os.path.isdir(save_dir):
+            save_dir = os.path.join(os.path.expanduser('~'), 'Pictures')
+            print(f"Screenshot path not set or invalid, falling back to: {save_dir}")
+
+        try:
+            os.makedirs(save_dir, exist_ok=True)
+            timestamp = QDateTime.currentDateTime().toString("yyyyMMdd_HHmmss")
+            filename = f"Screenshot_{timestamp}.{ss_format}"
+            filepath = os.path.join(save_dir, filename)
+
+            pixmap = graphics_widget.grab()
+            if pixmap.save(filepath):
+                print(f"Screenshot saved to {filepath}")
+            else:
+                print(f"Failed to save screenshot to {filepath}.")
+        except Exception as e:
+            print(f"Error taking screenshot: {e}")
+
+    if screenshot_btn:
+        screenshot_btn.clicked.connect(take_screenshot)
 
     # Initial state
     state = {
@@ -1016,13 +1634,17 @@ def main():
         if status_text:
             status_text.setText("Ready")
 
-    def _set_status_recording():
+    def _set_status_recording(is_resuming=False):
         # blinking red dot
         if status_icon:
             color = "#ff3b30" if state['blink_on'] else "#551111"
             status_icon.setStyleSheet(f"background-color: {color}; border-radius: 6px;")
         if status_text:
-            status_text.setText(f"REC {_format_time(state['elapsed'])}")
+            elapsed_str = _format_time(state['elapsed'])
+            if is_resuming:
+                status_text.setText("Resuming...")
+            else:
+                status_text.setText(f"REC {elapsed_str}")
 
     def _set_status_paused():
         if status_icon:
@@ -1056,10 +1678,12 @@ def main():
     blink_timer.timeout.connect(_on_blink_tick)
 
     def start_recording():
-        if recording_manager.start_recording():
-            print("[Main] Recording started via manager.")
+        manager_config = get_recording_config_from_settings()
+        if recording_manager.configure_recording(manager_config):
+            if not recording_manager.start_recording():
+                print("[Main] Failed to start recording via manager.")
         else:
-            print("[Main] Failed to start recording via manager.")
+            print("[Main] Failed to configure recording manager.")
 
     def stop_recording():
         recording_manager.stop_recording()
@@ -1075,21 +1699,17 @@ def main():
             print(f"Record toggle error: {e}")
 
     def on_play_pause_button_clicked():
-        # TODO: Implement pause/resume in RecordingManager
-        print("Pause/Resume is not yet implemented.")
-        # This is placeholder UI logic until the backend is ready
-        if not state['is_recording']:
+        if not recording_manager.is_recording():
             return
 
-        state['is_paused'] = not state['is_paused']
-        if state['is_paused']:
-            elapsed_timer.stop()
-            blink_timer.stop()
-            _set_status_paused()
+        if recording_manager.is_paused():
+            if recording_manager.resume_recording():
+                state['is_paused'] = False
+                _set_status_recording(is_resuming=True)
         else:
-            elapsed_timer.start()
-            blink_timer.start()
-            _set_status_recording(is_resuming=True)
+            if recording_manager.pause_recording():
+                state['is_paused'] = True
+                _set_status_paused()
 
     def on_screenshot_clicked():
         try:
@@ -1100,15 +1720,35 @@ def main():
             if pixmap.isNull():
                 print("Failed to grab screenshot")
                 return
+
+            # Get screenshot settings
+            settings = QSettings()
+            ss_location = settings.value('recording/screenshot_location', 'Same as video')
+            ss_format = settings.value('recording/screenshot_format', 'PNG').lower()
+            
+            save_dir = ''
+            if ss_location == 'Custom':
+                save_dir = settings.value('recording/custom_screenshot_path', '')
+            else:  # 'Same as video'
+                save_dir = settings.value('recording/destination_folder', '')
+
+            if not save_dir or not os.path.isdir(save_dir):
+                from PyQt6.QtCore import QStandardPaths
+                save_dir = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.PicturesLocation)
+                print(f"Screenshot path not set or invalid, falling back to: {save_dir}")
+
+            # Create filename
             ts = QDateTime.currentDateTime().toString("yyyyMMdd_HHmmss")
-            # Use QStandardPaths for a more robust pictures location
-            from PyQt6.QtCore import QStandardPaths
-            pictures_path = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.PicturesLocation)
-            out_dir = Path(pictures_path)
+            file_name = f"Screenshot_{ts}.{ss_format}"
+            
+            # Ensure directory exists and save
+            out_dir = Path(save_dir)
             out_dir.mkdir(parents=True, exist_ok=True)
-            out_path = out_dir / f"golive_shot_{ts}.png"
-            ok = pixmap.save(str(out_path))
+            out_path = out_dir / file_name
+            
+            ok = pixmap.save(str(out_path), ss_format)
             print(f"Screenshot {'saved to' if ok else 'failed saving to'} {out_path}")
+
         except Exception as e:
             print(f"Screenshot error: {e}")
 
@@ -1158,19 +1798,50 @@ def main():
             pause_btn.setEnabled(False)
             pause_btn.setChecked(False)
 
-    def on_recording_error(error_msg):
-        print(f"[REC ERROR] {error_msg}")
-        on_recording_stopped() # Visually stop on error
-        # Optionally, show a message box to the user
-        try:
-            from PyQt6.QtWidgets import QMessageBox
-            QMessageBox.critical(window, "Recording Error", error_msg)
-        except Exception as e:
-            print(f"Could not show error dialog: {e}")
+    def on_recording_error(message):
+        print(f"[Main] Recording Error: {message}")
+        # Ensure UI resets to a non-recording state
+        on_recording_stopped()
+
+        msg_box = QMessageBox(window)
+        msg_box.setIcon(QMessageBox.Icon.Critical)
+        msg_box.setText("Recording Error")
+        msg_box.setInformativeText(message)
+        msg_box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        msg_box.exec()
 
     recording_manager.recording_started.connect(on_recording_started)
     recording_manager.recording_stopped.connect(on_recording_stopped)
     recording_manager.recording_error.connect(on_recording_error)
+
+    # Setup cleanup on application exit
+    def cleanup_on_exit():
+        """Ensure all resources are released when the app closes."""
+        print("Cleaning up resources...")
+        try:
+            # Stop all streams
+            stream_manager.stop_all_streams()
+
+            # Stop recording
+            recording_manager.stop_recording()
+
+            # Cleanup video inputs
+            video_input_manager.cleanup_resources()
+
+            # Clear graphics effects
+            graphics_manager.clear_all_frames()
+
+            # Cleanup HDMI streams
+            hdmi_manager.cleanup()
+
+            # Stop audio compositor
+            audio_compositor.stop()
+
+            print("Cleanup completed successfully")
+        except Exception as e:
+            print(f"Error during cleanup: {e}")
+    
+    app.aboutToQuit.connect(cleanup_on_exit)
 
     window.show()
     return app.exec()

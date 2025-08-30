@@ -70,27 +70,43 @@ def gst_sample_to_qimage(sample: Gst.Sample) -> QImage:
         buf.unmap(mapinfo)
 
 
-def qimage_to_gst_buffer(img: QImage) -> Gst.Buffer:
-    """Convert a QImage to a Gst.Buffer (ARGB). Converts format when necessary."""
+def qimage_to_gst_buffer(img: QImage, prealloc: bytearray | None = None) -> Gst.Buffer:
+    """Convert a QImage to a Gst.Buffer (BGRx).
+    Optionally reuse a provided preallocated bytearray to reduce allocations.
+    """
     if img.isNull():
         raise ValueError("QImage is null")
 
-    # Ensure ARGB32
-    if img.format() != QImage.Format.Format_ARGB32:
-        img = img.convertToFormat(QImage.Format.Format_ARGB32)
+    # Ensure RGB32 (opaque); memory layout is B,G,R,0xFF on little-endian
+    if img.format() != QImage.Format.Format_RGB32:
+        img = img.convertToFormat(QImage.Format.Format_RGB32)
 
     width = img.width()
     height = img.height()
     stride = img.bytesPerLine()
 
-    # Make a deep copy of the pixel data
-    ptr = img.bits()
+    # Pack to tight rows (width*4) to avoid padding issues in appsrc; matches BGRx stride
+    tight_row = width * 4
+    total = tight_row * height
+    if prealloc is not None and len(prealloc) == total:
+        packed = prealloc
+    else:
+        packed = bytearray(total)
+    ptr = img.constBits()
     ptr.setsize(stride * height)
-    data = bytes(ptr)
+    mv = memoryview(ptr)
+    if stride == tight_row:
+        # Already tight
+        packed[:] = mv
+    else:
+        # Copy row by row excluding padding
+        for y in range(height):
+            src_off = y * stride
+            dst_off = y * tight_row
+            packed[dst_off:dst_off + tight_row] = mv[src_off:src_off + tight_row]
 
-    buffer = Gst.Buffer.new_allocate(None, len(data), None)
-    # Write bytes into buffer using fill to avoid immutable mapinfo.data issues
-    buffer.fill(0, data)
+    buffer = Gst.Buffer.new_allocate(None, len(packed), None)
+    buffer.fill(0, packed)
 
     # Set timestamps downstream if needed at appsrc
     return buffer
@@ -190,6 +206,12 @@ class GstQtStreamer(QObject):
         self._height = int(height)
         self._fps = int(fps)
         self._timestamp_ns = 0
+        # Async push worker to avoid blocking UI on conversion/encode
+        self._q: 'queue.Queue[QImage]' | None = None
+        self._worker_thread: 'threading.Thread' | None = None
+        self._stop_flag: bool = False
+        # Reusable packing buffer to reduce allocations
+        self._pack_buf: bytearray | None = None
 
     def start(self) -> None:
         if self._pipeline:
@@ -202,9 +224,9 @@ class GstQtStreamer(QObject):
         if self._appsrc is None:
             raise RuntimeError("appsrc named 'qtappsrc' not found in pipeline")
 
-        # caps on appsrc
+        # caps on appsrc (BGRx, opaque)
         caps = Gst.Caps.from_string(
-            f"video/x-raw,format=BGRA,width={self._width},height={self._height},framerate={self._fps}/1"
+            f"video/x-raw,format=BGRx,width={self._width},height={self._height},framerate={self._fps}/1"
         )
         self._appsrc.set_property('caps', caps)
         self._appsrc.set_property('is-live', True)
@@ -219,29 +241,64 @@ class GstQtStreamer(QObject):
 
         self._pipeline.set_state(Gst.State.PLAYING)
         self._timestamp_ns = 0
+        # Start async worker
+        self._start_worker()
+
+    def pause(self) -> bool:
+        if not self._pipeline:
+            return False
+        ret = self._pipeline.set_state(Gst.State.PAUSED)
+        is_success = ret != Gst.StateChangeReturn.FAILURE
+        if is_success:
+            print("[GstQtStreamer] Pipeline paused")
+        return is_success
+
+    def resume(self) -> bool:
+        if not self._pipeline:
+            return False
+        ret = self._pipeline.set_state(Gst.State.PLAYING)
+        is_success = ret != Gst.StateChangeReturn.FAILURE
+        if is_success:
+            print("[GstQtStreamer] Pipeline resumed")
+        return is_success
 
     def stop(self) -> None:
         if not self._pipeline:
             return
+        # Stop async worker first
+        self._stop_worker()
+        try:
+            # Signal EOS so muxers can finalize indexes (e.g., mp4)
+            if self._appsrc is not None:
+                try:
+                    self._appsrc.emit('end-of-stream')
+                except Exception:
+                    pass
+            # Wait up to 3s for EOS or ERROR
+            bus = self._pipeline.get_bus()
+            if bus is not None:
+                bus.timed_pop_filtered(3 * Gst.SECOND, Gst.MessageType.EOS | Gst.MessageType.ERROR)
+        except Exception:
+            pass
         self._pipeline.set_state(Gst.State.NULL)
         self._pipeline = None
         self._appsrc = None
+        self._pack_buf = None
 
     def push_qimage(self, img: QImage) -> None:
-        if self._appsrc is None:
+        # Enqueue frame for async processing; drop if queue full
+        if self._q is None:
             return
-        if img.width() != self._width or img.height() != self._height:
-            img = img.scaled(self._width, self._height, Qt.AspectRatioMode.IgnoreAspectRatio)
-        buf = qimage_to_gst_buffer(img)
-        # Optionally set PTS/DTS manually for constant framerate pacing
-        dur = int(1e9 / max(1, self._fps))
-        buf.pts = self._timestamp_ns
-        buf.duration = dur
-        self._timestamp_ns += dur
-        # Push
-        flow = self._appsrc.emit('push-buffer', buf)
-        if flow != Gst.FlowReturn.OK:
-            print(f"[GstQtStreamer] push-buffer flow: {flow}")
+        try:
+            # Prefer latest frames: if full, get_nowait() oldest and discard
+            if self._q.full():
+                try:
+                    _ = self._q.get_nowait()
+                except Exception:
+                    pass
+            self._q.put_nowait(img)
+        except Exception:
+            pass
 
     def _on_bus_message(self, bus: Gst.Bus, msg: Gst.Message):
         if msg.type == Gst.MessageType.ERROR:
@@ -252,6 +309,64 @@ class GstQtStreamer(QObject):
             print(f"[GstQtStreamer] WARNING: {err} | debug: {dbg}")
         elif msg.type == Gst.MessageType.EOS:
             print("[GstQtStreamer] EOS")
+        elif msg.type == Gst.MessageType.STATE_CHANGED:
+            old_state, new_state, pending_state = msg.parse_state_changed()
+            if msg.src == self._pipeline:
+                print(f"[GstQtStreamer] Pipeline state: {old_state.value_nick} -> {new_state.value_nick}")
+        elif msg.type == Gst.MessageType.STREAM_START:
+            print("[GstQtStreamer] Stream started")
+        elif msg.type == Gst.MessageType.ASYNC_DONE:
+            print("[GstQtStreamer] Async done")
+
+    # -------------- Worker --------------
+    def _start_worker(self) -> None:
+        try:
+            import threading, queue
+            self._stop_flag = False
+            self._q = queue.Queue(maxsize=1)
+            # Initialize reusable pack buffer sized for current WxH
+            try:
+                self._pack_buf = bytearray(self._width * self._height * 4)
+            except Exception:
+                self._pack_buf = None
+
+            def _run():
+                while not self._stop_flag:
+                    try:
+                        img: QImage = self._q.get(timeout=0.1)  # wait for frame
+                    except Exception:
+                        continue
+                    try:
+                        if self._appsrc is None or img is None or img.isNull():
+                            continue
+                        # Scale-to-fill and crop if needed
+                        if img.width() != self._width or img.height() != self._height:
+                            scaled = img.scaled(self._width, self._height, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.FastTransformation)
+                            x = max(0, (scaled.width() - self._width) // 2)
+                            y = max(0, (scaled.height() - self._height) // 2)
+                            img = scaled.copy(x, y, self._width, self._height)
+                        buf = qimage_to_gst_buffer(img, self._pack_buf)
+                        flow = self._appsrc.emit('push-buffer', buf)
+                        if flow != Gst.FlowReturn.OK:
+                            print(f"[GstQtStreamer] push-buffer flow: {flow}")
+                    except Exception as e:
+                        print(f"[GstQtStreamer] Worker error: {e}")
+
+            self._worker_thread = threading.Thread(target=_run, name="GstQtStreamerWorker", daemon=True)
+            self._worker_thread.start()
+        except Exception as e:
+            print(f"[GstQtStreamer] Failed to start worker: {e}")
+
+    def _stop_worker(self) -> None:
+        try:
+            self._stop_flag = True
+            if self._worker_thread:
+                self._worker_thread.join(timeout=1.0)
+        except Exception:
+            pass
+        finally:
+            self._worker_thread = None
+            self._q = None
 
 
 # ----------------------------
@@ -266,6 +381,11 @@ class QtSceneToGstStreamer(QObject):
         self.size = size
         self.fps = int(fps)
         self.timer = QTimer(self)
+        try:
+            # More accurate pacing to reduce jitter
+            self.timer.setTimerType(Qt.TimerType.PreciseTimer)
+        except Exception:
+            pass
         self.timer.timeout.connect(self._on_tick)
         self.streamer = GstQtStreamer(pipeline_desc, size.width(), size.height(), fps, self)
 
@@ -274,22 +394,63 @@ class QtSceneToGstStreamer(QObject):
         interval_ms = int(1000 / max(1, self.fps))
         self.timer.start(interval_ms)
 
+    def pause(self) -> bool:
+        self.timer.stop()
+        return self.streamer.pause()
+
+    def resume(self) -> bool:
+        if self.streamer.resume():
+            interval_ms = int(1000 / max(1, self.fps))
+            self.timer.start(interval_ms)
+            return True
+        return False
+
     def stop(self):
         self.timer.stop()
         self.streamer.stop()
 
     def _on_tick(self):
-        # Render scene to QImage (BGRA)
-        img = QImage(self.size, QImage.Format.Format_ARGB32)
-        img.fill(Qt.GlobalColor.black)
-        from PyQt6.QtGui import QPainter
-        p = QPainter(img)
-        # If scene has sceneRect, render QGraphicsScene
-        if hasattr(self.scene, 'render'):
-            target = QRectF(0, 0, self.size.width(), self.size.height())
-            self.scene.render(p, target)  # source rect auto
-        p.end()
-        self.streamer.push_qimage(img)
+        # Prefer viewport grab first (fast, captures HW video), then fallback to render()
+        img = None
+        try:
+            if hasattr(self.scene, 'viewport') and callable(getattr(self.scene, 'viewport')):
+                vp = self.scene.viewport()
+                if vp is not None:
+                    pm = vp.grab()
+                    img = pm.toImage()
+            if (img is None or img.isNull()) and hasattr(self.scene, 'grab'):
+                pm = self.scene.grab()
+                img = pm.toImage()
+        except Exception as e:
+            print(f"[QtSceneToGstStreamer] QWidget grab failed: {e}")
+
+        if img is None or img.isNull():
+            # Fallback to render (slower, but always available)
+            img = QImage(self.size, QImage.Format.Format_ARGB32)
+            img.fill(Qt.GlobalColor.black)
+            from PyQt6.QtGui import QPainter
+            try:
+                if hasattr(self.scene, 'render'):
+                    p = QPainter(img)
+                    target = QRectF(0, 0, self.size.width(), self.size.height())
+                    self.scene.render(p, target)
+                    p.end()
+            except Exception as e:
+                print(f"[QtSceneToGstStreamer] view.render failed: {e}")
+
+        # Save first frame for debugging
+        if not hasattr(self, '_debug_saved'):
+            try:
+                img.save("debug_frame.png")
+                self._debug_saved = True
+                print("[QtSceneToGstStreamer] Debug frame saved")
+            except Exception as e:
+                print(f"[QtSceneToGstStreamer] Failed to save debug frame: {e}")
+
+        if not img.isNull():
+            self.streamer.push_qimage(img)
+        else:
+            print("[QtSceneToGstStreamer] Warning: Rendered image is null")
 
 
 # ----------------------------

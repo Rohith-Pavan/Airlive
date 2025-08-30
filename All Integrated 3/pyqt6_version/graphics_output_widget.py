@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QWidget, QVBoxLayout, QGraphicsPixmapItem, QSizePolicy
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QRectF
-from PyQt6.QtGui import QPixmap, QPainter, QBrush, QColor
+from PyQt6.QtGui import QPixmap, QPainter, QBrush, QColor, QImage
 from PyQt6.QtMultimedia import QMediaPlayer, QCamera, QMediaCaptureSession
 from PyQt6.QtMultimediaWidgets import QGraphicsVideoItem
 
@@ -186,29 +186,50 @@ class GraphicsOutputWidget(QGraphicsView):
         self.overlay_item = None
         self.current_frame_path = None
         
+        # HDMI mirroring
+        self.hdmi_mirrors = []  # List of HDMI video widgets to mirror to
+        self.hdmi_update_timer = None
+        
         # Setup the view
         self.setup_view()
         
         # Create video item
         self.create_video_item()
         
+        # Setup HDMI mirroring timer
+        self.setup_hdmi_mirroring()
+        
     def setup_view(self):
-        """Configure the graphics view"""
+        """Configure the graphics view - ENHANCED FOR MAXIMUM QUALITY"""
         # Set background color
         self.setStyleSheet("background-color: black;")
         
-        # Configure view properties
-        self.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # Configure view properties with MAXIMUM QUALITY settings
+        self.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        self.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+        
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         
-        # Reduce update frequency to prevent blinking
-        self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.MinimalViewportUpdate)
-        self.setOptimizationFlag(QGraphicsView.OptimizationFlag.DontAdjustForAntialiasing, True)
+        # ENHANCED: Full viewport updates for maximum quality
+        self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.FullViewportUpdate)
+        
+        # ENHANCED: Enable all optimizations for quality
+        self.setOptimizationFlag(QGraphicsView.OptimizationFlag.DontSavePainterState, False)
+        self.setOptimizationFlag(QGraphicsView.OptimizationFlag.DontAdjustForAntialiasing, False)
         
         # Fit scene in view
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
+        
+        # ENHANCED: Set cache mode for better performance (PyQt6 compatible)
+        try:
+            # Try to set cache mode - may not be available in all PyQt6 versions
+            self.setCacheMode(self.CacheBackground)
+        except (AttributeError, TypeError):
+            # Cache mode not available in this PyQt6 version - skip
+            pass
         
     def create_video_item(self):
         """Create the video graphics item"""
@@ -466,6 +487,91 @@ class GraphicsOutputWidget(QGraphicsView):
     def get_current_frame(self):
         """Get the current frame path"""
         return self.current_frame_path
+    
+    def add_hdmi_mirror(self, hdmi_widget):
+        """Add an HDMI video widget to mirror output to"""
+        if hdmi_widget not in self.hdmi_mirrors:
+            self.hdmi_mirrors.append(hdmi_widget)
+            self._check_hdmi_timer_state()
+            print(f"Added HDMI mirror: {hdmi_widget}")
+    
+    def remove_hdmi_mirror(self, hdmi_widget):
+        """Remove an HDMI video widget from mirroring"""
+        if hdmi_widget in self.hdmi_mirrors:
+            self.hdmi_mirrors.remove(hdmi_widget)
+            self._check_hdmi_timer_state()
+            print(f"Removed HDMI mirror: {hdmi_widget}")
+    
+    def clear_hdmi_mirrors(self):
+        """Clear all HDMI mirrors"""
+        self.hdmi_mirrors.clear()
+        self._check_hdmi_timer_state()
+        print("Cleared all HDMI mirrors")
+    
+    def _update_hdmi_mirrors(self):
+        """Update all HDMI mirrors with current frame - ENHANCED QUALITY"""
+        if not self.hdmi_mirrors:
+            return
+            
+        try:
+            # Capture current frame with MAXIMUM QUALITY
+            # Use device pixel ratio for high-DPI displays
+            device_ratio = self.devicePixelRatio()
+            
+            # Capture at native resolution with high quality
+            pixmap = self.grab()
+            if not pixmap.isNull():
+                # Convert to high-quality image with optimal format
+                image = pixmap.toImage()
+                if not image.isNull():
+                    # Convert to optimal format for quality
+                    image = image.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+                
+                # Scale to target resolution if needed (maintain aspect ratio)
+                if image.width() != 1920 or image.height() != 1080:
+                    # Scale to 1080p with high-quality scaling
+                    image = image.scaled(
+                        1920, 1080,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation
+                    )
+                
+                # Send to all HDMI mirrors
+                for hdmi_widget in self.hdmi_mirrors[:]:  # Copy list to avoid modification during iteration
+                    try:
+                        if hasattr(hdmi_widget, 'set_qimage_frame'):
+                            hdmi_widget.set_qimage_frame(image)
+                    except Exception as e:
+                        print(f"Error updating HDMI mirror {hdmi_widget}: {e}")
+                        # Remove broken mirror
+                        self.hdmi_mirrors.remove(hdmi_widget)
+                        
+        except Exception as e:
+            print(f"Error updating HDMI mirrors: {e}")
+    
+    def setup_hdmi_mirroring(self):
+        """Setup HDMI mirroring timer - ENHANCED FOR MAXIMUM QUALITY"""
+        from PyQt6.QtCore import QTimer
+        
+        self.hdmi_update_timer = QTimer()
+        # ENHANCED: 60 FPS for ultra-smooth playback (16.67ms interval)
+        self.hdmi_update_timer.setInterval(16)  # ~60 FPS for maximum smoothness
+        self.hdmi_update_timer.timeout.connect(self._update_hdmi_mirrors)
+        
+        # Use precise timer for better timing accuracy
+        self.hdmi_update_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        
+        # Start timer only when there are mirrors
+        self._check_hdmi_timer_state()
+    
+    def _check_hdmi_timer_state(self):
+        """Start/stop HDMI timer based on whether there are active mirrors"""
+        if self.hdmi_mirrors and not self.hdmi_update_timer.isActive():
+            self.hdmi_update_timer.start()
+            print("Started HDMI mirroring timer")
+        elif not self.hdmi_mirrors and self.hdmi_update_timer.isActive():
+            self.hdmi_update_timer.stop()
+            print("Stopped HDMI mirroring timer")
 
 class GraphicsOutputManager(QObject):
     """Manager for handling graphics output widgets"""

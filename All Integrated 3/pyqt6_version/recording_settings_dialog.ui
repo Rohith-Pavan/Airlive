@@ -1,0 +1,305 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>RecordingSettingsDialog</class>
+ <widget class="QDialog" name="RecordingSettingsDialog">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>400</width>
+    <height>450</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>Recording Settings</string>
+  </property>
+  <layout class="QVBoxLayout" name="verticalLayout">
+   <item>
+    <widget class="QGroupBox" name="saveOptionsGroupBox">
+     <property name="title">
+      <string>Save Options</string>
+     </property>
+     <layout class="QGridLayout" name="gridLayout">
+      <item row="0" column="0">
+       <widget class="QLabel" name="destinationFolderLabel">
+        <property name="text">
+         <string>Destination Folder</string>
+        </property>
+       </widget>
+      </item>
+      <item row="0" column="1">
+       <widget class="QLineEdit" name="destinationFolderLineEdit"/>
+      </item>
+      <item row="0" column="2">
+       <widget class="QPushButton" name="browseFolderButton">
+        <property name="text">
+         <string>Browse...</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="0">
+       <widget class="QLabel" name="fileNamePatternLabel">
+        <property name="text">
+         <string>File Name Pattern</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="1" colspan="2">
+       <widget class="QLineEdit" name="fileNamePatternLineEdit">
+        <property name="placeholderText">
+         <string>Recording_{date}_{time}</string>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <item>
+    <widget class="QGroupBox" name="formatQualityGroupBox">
+     <property name="title">
+      <string>Format &amp; Quality</string>
+     </property>
+     <layout class="QGridLayout" name="gridLayout_2">
+      <item row="0" column="0">
+       <widget class="QLabel" name="videoFormatLabel">
+        <property name="text">
+         <string>Video Format</string>
+        </property>
+       </widget>
+      </item>
+      <item row="0" column="1">
+       <widget class="QComboBox" name="videoFormatComboBox">
+        <item>
+         <property name="text">
+          <string>MP4</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>MKV</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>AVI</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>FLV</string>
+         </property>
+        </item>
+       </widget>
+      </item>
+      <item row="1" column="0">
+       <widget class="QLabel" name="qualityPresetLabel">
+        <property name="text">
+         <string>Quality Preset</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="1">
+       <widget class="QComboBox" name="qualityPresetComboBox">
+        <item>
+         <property name="text">
+          <string>Low</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>Medium</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>High</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>Custom</string>
+         </property>
+        </item>
+       </widget>
+      </item>
+      <item row="2" column="0">
+       <widget class="QLabel" name="bitrateLabel">
+        <property name="text">
+         <string>Bitrate (kbps)</string>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="1">
+       <widget class="QLineEdit" name="bitrateLineEdit"/>
+      </item>
+      <item row="3" column="0">
+       <widget class="QLabel" name="resolutionLabel">
+        <property name="text">
+         <string>Resolution</string>
+        </property>
+       </widget>
+      </item>
+      <item row="3" column="1">
+       <widget class="QComboBox" name="resolutionComboBox">
+        <item>
+         <property name="text">
+          <string>720p</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>1080p</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>2K</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>4K</string>
+         </property>
+        </item>
+       </widget>
+      </item>
+      <item row="4" column="0">
+       <widget class="QLabel" name="frameRateLabel">
+        <property name="text">
+         <string>Frame Rate (FPS)</string>
+        </property>
+       </widget>
+      </item>
+      <item row="4" column="1">
+       <widget class="QComboBox" name="frameRateComboBox">
+        <item>
+         <property name="text">
+          <string>30</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>60</string>
+         </property>
+        </item>
+       </widget>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <item>
+    <widget class="QGroupBox" name="screenshotOptionsGroupBox">
+     <property name="title">
+      <string>Screenshot Options</string>
+     </property>
+     <layout class="QGridLayout" name="gridLayout_3">
+      <item row="0" column="0">
+       <widget class="QLabel" name="screenshotFormatLabel">
+        <property name="text">
+         <string>Format</string>
+        </property>
+       </widget>
+      </item>
+      <item row="0" column="1">
+       <widget class="QComboBox" name="screenshotFormatComboBox">
+        <item>
+         <property name="text">
+          <string>PNG</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>JPG</string>
+         </property>
+        </item>
+       </widget>
+      </item>
+      <item row="1" column="0">
+       <widget class="QLabel" name="screenshotLocationLabel">
+        <property name="text">
+         <string>Save Location</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="1">
+       <widget class="QComboBox" name="screenshotLocationComboBox">
+        <item>
+         <property name="text">
+          <string>Same as video</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>Custom</string>
+         </property>
+        </item>
+       </widget>
+      </item>
+      <item row="2" column="0">
+       <widget class="QLabel" name="screenshotFolderLabel">
+        <property name="text">
+         <string>Screenshot Folder</string>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="1">
+       <widget class="QLineEdit" name="screenshotFolderLineEdit"/>
+      </item>
+      <item row="2" column="2">
+       <widget class="QPushButton" name="browseScreenshotFolderButton">
+        <property name="text">
+         <string>Browse...</string>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <item>
+    <widget class="QDialogButtonBox" name="buttonBox">
+     <property name="orientation">
+      <enum>Qt::Horizontal</enum>
+     </property>
+     <property name="standardButtons">
+      <set>QDialogButtonBox::Cancel|QDialogButtonBox::Ok</set>
+     </property>
+    </widget>
+   </item>
+  </layout>
+ </widget>
+ <resources/>
+ <connections>
+  <connection>
+   <sender>buttonBox</sender>
+   <signal>accepted()</signal>
+   <receiver>RecordingSettingsDialog</receiver>
+   <slot>accept()</slot>
+   <hints>
+    <hint type="sourcelabel">
+     <x>248</x>
+     <y>254</y>
+    </hint>
+    <hint type="destinationlabel">
+     <x>157</x>
+     <y>274</y>
+    </hint>
+   </hints>
+  </connection>
+  <connection>
+   <sender>buttonBox</sender>
+   <signal>rejected()</signal>
+   <receiver>RecordingSettingsDialog</receiver>
+   <slot>reject()</slot>
+   <hints>
+    <hint type="sourcelabel">
+     <x>316</x>
+     <y>260</y>
+    </hint>
+    <hint type="destinationlabel">
+     <x>286</x>
+     <y>274</y>
+    </hint>
+   </hints>
+  </connection>
+ </connections>
+</ui>

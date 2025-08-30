@@ -14,6 +14,7 @@ class EffectFrame(QFrame):
     """Custom frame widget for displaying effect PNGs with selection functionality"""
     
     clicked = pyqtSignal(str, str)  # tab_name, effect_path
+    double_clicked = pyqtSignal(str, str)  # tab_name, effect_path (for removal)
     
     def __init__(self, tab_name, effect_path=None, parent=None):
         super().__init__(parent)
@@ -76,11 +77,18 @@ class EffectFrame(QFrame):
         if event.button() == Qt.MouseButton.LeftButton and self.effect_path:
             self.clicked.emit(self.tab_name, self.effect_path)
         super().mousePressEvent(event)
+    
+    def mouseDoubleClickEvent(self, event):
+        """Handle mouse double-click events for effect removal"""
+        if event.button() == Qt.MouseButton.LeftButton and self.effect_path and self.is_selected:
+            self.double_clicked.emit(self.tab_name, self.effect_path)
+        super().mouseDoubleClickEvent(event)
 
 class EffectsManager(QObject):
     """Manager class for handling effects across all tabs"""
     
     effect_selected = pyqtSignal(str, str)  # tab_name, effect_path
+    effect_removed = pyqtSignal(str, str)   # tab_name, effect_path (for double-click removal)
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -123,6 +131,7 @@ class EffectsManager(QObject):
         for png_path in png_files:
             effect_frame = EffectFrame(tab_name, png_path)
             effect_frame.clicked.connect(self.on_effect_clicked)
+            effect_frame.double_clicked.connect(self.on_effect_double_clicked)
             
             grid_layout.addWidget(effect_frame, row, col)
             self.effect_frames[tab_name].append(effect_frame)
@@ -173,6 +182,22 @@ class EffectsManager(QObject):
         
         # Emit signals for external handling
         self.effect_selected.emit(tab_name, effect_path)
+    
+    def on_effect_double_clicked(self, tab_name, effect_path):
+        """Handle effect removal via double-click"""
+        # Clear the selection in this tab
+        if self.selected_effects[tab_name] == effect_path:
+            for frame in self.effect_frames[tab_name]:
+                if frame.effect_path == effect_path:
+                    frame.set_selected(False)
+                    break
+            
+            # Clear the selected effect
+            self.selected_effects[tab_name] = None
+            
+            # Emit removal signal for external handling
+            self.effect_removed.emit(tab_name, effect_path)
+            print(f"Effect removed from {tab_name}: {Path(effect_path).name}")
     
     def get_selected_effect(self, tab_name):
         """Get the currently selected effect for a tab"""

@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import QApplication
 from PyQt6.QtGui import QPixmap, QPainter, QImage
 from PyQt6.QtCore import Qt
 from ffmpeg_locator import find_ffmpeg, ensure_ffmpeg_available
+from hdmi_stream_manager import get_hdmi_stream_manager
 
 class StreamCaptureThread(QThread):
     """Thread for capturing frames from QGraphicsScene and feeding to FFmpeg"""

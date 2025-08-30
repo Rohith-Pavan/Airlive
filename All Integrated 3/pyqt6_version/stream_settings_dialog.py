@@ -12,6 +12,7 @@ from PyQt6.QtGui import QFont
 import json
 import os
 from pathlib import Path
+from display_manager import get_display_manager
 
 
 class StreamSettingsDialog(QDialog):
@@ -23,9 +24,13 @@ class StreamSettingsDialog(QDialog):
         super().__init__(parent)
         self.stream_name = stream_name
         self.stream_manager = stream_manager
+        self.display_manager = get_display_manager()
         self.settings = self.load_default_settings()
         self.setup_ui()
         self.load_saved_settings()
+        
+        # Connect display manager signals
+        self.display_manager.displays_changed.connect(self.update_display_options)
         
     def setup_ui(self):
         """Setup the user interface"""
@@ -96,27 +101,37 @@ class StreamSettingsDialog(QDialog):
         
         # Platform selection
         self.platform_combo = QComboBox()
-        self.platform_combo.addItems([
+        platform_items = [
             "Custom RTMP",
             "Twitch",
             "YouTube Live", 
             "Facebook Live",
             "Custom HLS",
             "Custom WebRTC"
-        ])
+        ]
+        
+        # Add HDMI Display option if multiple displays are available (any type)
+        total_displays = len(self.display_manager.get_displays())
+        if total_displays > 1:
+            platform_items.insert(0, "HDMI Display")
+            print(f"HDMI Display option added - {total_displays} displays detected")
+            
+        self.platform_combo.addItems(platform_items)
         self.platform_combo.currentTextChanged.connect(self.on_platform_changed)
         dest_layout.addRow("Platform:", self.platform_combo)
         
         # Stream URL
         self.url_edit = QLineEdit()
         self.url_edit.setPlaceholderText("rtmp://live.twitch.tv/live/")
-        dest_layout.addRow("Stream URL:", self.url_edit)
+        self.url_label = QLabel("Stream URL:")
+        dest_layout.addRow(self.url_label, self.url_edit)
         
         # Stream Key
         self.key_edit = QLineEdit()
         self.key_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.key_edit.setPlaceholderText("Your stream key")
-        dest_layout.addRow("Stream Key:", self.key_edit)
+        self.key_label = QLabel("Stream Key:")
+        dest_layout.addRow(self.key_label, self.key_edit)
         
         # Show key checkbox
         self.show_key_checkbox = QCheckBox("Show stream key")
@@ -124,6 +139,37 @@ class StreamSettingsDialog(QDialog):
         dest_layout.addRow("", self.show_key_checkbox)
         
         layout.addWidget(dest_group)
+        
+        # HDMI Display settings group (initially hidden)
+        self.hdmi_group = QGroupBox("HDMI Display Settings")
+        hdmi_layout = QFormLayout(self.hdmi_group)
+        
+        # Display selection
+        self.display_combo = QComboBox()
+        self.update_display_options()
+        hdmi_layout.addRow("Target Display:", self.display_combo)
+        
+        # Display mode
+        self.display_mode_combo = QComboBox()
+        self.display_mode_combo.addItems([
+            "Fullscreen",
+            "Windowed (800x600)",
+            "Windowed (1024x768)",
+            "Windowed (1280x720)"
+        ])
+        hdmi_layout.addRow("Display Mode:", self.display_mode_combo)
+        
+        # Always on top
+        self.always_on_top_checkbox = QCheckBox("Always on top")
+        hdmi_layout.addRow("", self.always_on_top_checkbox)
+        
+        # Match display resolution
+        self.match_display_res_checkbox = QCheckBox("Match display resolution")
+        self.match_display_res_checkbox.setChecked(True)
+        hdmi_layout.addRow("", self.match_display_res_checkbox)
+        
+        layout.addWidget(self.hdmi_group)
+        self.hdmi_group.hide()  # Initially hidden
         
         # Video settings group
         video_group = QGroupBox("Video Settings")
@@ -323,17 +369,39 @@ class StreamSettingsDialog(QDialog):
         
     def on_platform_changed(self, platform):
         """Handle platform selection change"""
-        platform_urls = {
-            "Twitch": "rtmp://live.twitch.tv/live/",
-            "YouTube Live": "rtmp://a.rtmp.youtube.com/live2/",
-            "Facebook Live": "rtmps://live-api-s.facebook.com:443/rtmp/",
-            "Custom RTMP": "",
-            "Custom HLS": "",
-            "Custom WebRTC": ""
-        }
+        is_hdmi = platform == "HDMI Display"
         
-        if platform in platform_urls:
-            self.url_edit.setText(platform_urls[platform])
+        # Show/hide appropriate settings groups
+        if hasattr(self, 'hdmi_group'):
+            self.hdmi_group.setVisible(is_hdmi)
+        
+        # Show/hide streaming-related fields
+        streaming_widgets = [
+            self.url_edit, self.key_edit, self.show_key_checkbox
+        ]
+        
+        for widget in streaming_widgets:
+            widget.setVisible(not is_hdmi)
+            
+        # Update labels visibility
+        if hasattr(self, 'url_label'):
+            self.url_label.setVisible(not is_hdmi)
+        if hasattr(self, 'key_label'):
+            self.key_label.setVisible(not is_hdmi)
+        
+        # Set platform URLs for streaming platforms
+        if not is_hdmi:
+            platform_urls = {
+                "Twitch": "rtmp://live.twitch.tv/live/",
+                "YouTube Live": "rtmp://a.rtmp.youtube.com/live2/",
+                "Facebook Live": "rtmps://live-api-s.facebook.com:443/rtmp/",
+                "Custom RTMP": "",
+                "Custom HLS": "",
+                "Custom WebRTC": ""
+            }
+            
+            if platform in platform_urls:
+                self.url_edit.setText(platform_urls[platform])
             
     def on_resolution_changed(self, resolution):
         """Handle resolution selection change"""
@@ -421,6 +489,24 @@ class StreamSettingsDialog(QDialog):
             
         self.show_status("Connection test passed", error=False)
         
+    def update_display_options(self):
+        """Update display options in combo box"""
+        if not hasattr(self, 'display_combo'):
+            return
+            
+        current_text = self.display_combo.currentText()
+        self.display_combo.clear()
+        
+        display_options = self.display_manager.get_display_options_for_combo()
+        for display_name, display_index in display_options:
+            self.display_combo.addItem(display_name, display_index)
+            
+        # Try to restore previous selection
+        if current_text:
+            index = self.display_combo.findText(current_text)
+            if index >= 0:
+                self.display_combo.setCurrentIndex(index)
+        
     def show_status(self, message, error=False):
         """Show status message"""
         # Create a temporary status label
@@ -447,6 +533,44 @@ class StreamSettingsDialog(QDialog):
         # Emit so external listeners can save/update
         self.settings_saved.emit(self.settings)
 
+        platform = self.settings.get("platform", "")
+        is_hdmi = platform == "HDMI Display"
+        
+        if is_hdmi:
+            self._start_hdmi_stream()
+        else:
+            self._start_network_stream()
+    
+    def _start_hdmi_stream(self):
+        """Start HDMI display streaming"""
+        from hdmi_stream_manager import get_hdmi_stream_manager
+        
+        hdmi_manager = get_hdmi_stream_manager()
+        
+        # Validate HDMI settings
+        if "hdmi_display_index" not in self.settings:
+            self.show_status("Please select a display for HDMI output", error=True)
+            return
+        
+        try:
+            # Configure HDMI stream
+            if not hdmi_manager.configure_hdmi_stream(self.stream_name, self.settings):
+                self.show_status("Failed to configure HDMI stream", error=True)
+                return
+            
+            self.show_status(f"Starting HDMI output on display {self.settings['hdmi_display_index']}...", error=False)
+            
+            # Start HDMI stream
+            if hdmi_manager.start_hdmi_stream(self.stream_name):
+                self.show_status("HDMI display started successfully", error=False)
+            else:
+                self.show_status("Failed to start HDMI display", error=True)
+                
+        except Exception as e:
+            self.show_status(f"Error starting HDMI stream: {str(e)}", error=True)
+    
+    def _start_network_stream(self):
+        """Start network streaming (RTMP/etc)"""
         if not self.stream_manager:
             self.show_status("No StreamManager available", error=True)
             return
@@ -484,6 +608,31 @@ class StreamSettingsDialog(QDialog):
 
     def stop_stream_action(self):
         """Stop streaming via StreamManager"""
+        platform = self.settings.get("platform", "")
+        is_hdmi = platform == "HDMI Display"
+        
+        if is_hdmi:
+            self._stop_hdmi_stream()
+        else:
+            self._stop_network_stream()
+    
+    def _stop_hdmi_stream(self):
+        """Stop HDMI display streaming"""
+        from hdmi_stream_manager import get_hdmi_stream_manager
+        
+        hdmi_manager = get_hdmi_stream_manager()
+        
+        try:
+            if hdmi_manager.is_hdmi_streaming(self.stream_name):
+                hdmi_manager.stop_hdmi_stream(self.stream_name)
+                self.show_status("HDMI display stopped", error=False)
+            else:
+                self.show_status("HDMI display not active", error=True)
+        except Exception as e:
+            self.show_status(f"Error stopping HDMI stream: {str(e)}", error=True)
+    
+    def _stop_network_stream(self):
+        """Stop network streaming"""
         if not self.stream_manager:
             self.show_status("No StreamManager available", error=True)
             return
@@ -525,6 +674,15 @@ class StreamSettingsDialog(QDialog):
             "reconnect_attempts": self.reconnect_spinbox.value(),
             "low_latency": self.low_latency_checkbox.isChecked()
         }
+        
+        # Add HDMI-specific settings
+        if hasattr(self, 'display_combo') and self.display_combo.currentData() is not None:
+            settings.update({
+                "hdmi_display_index": self.display_combo.currentData(),
+                "hdmi_display_mode": self.display_mode_combo.currentText(),
+                "hdmi_always_on_top": self.always_on_top_checkbox.isChecked(),
+                "hdmi_match_resolution": self.match_display_res_checkbox.isChecked()
+            })
         
         return settings
         
@@ -596,12 +754,34 @@ class StreamSettingsDialog(QDialog):
         # Set checkbox
         if "low_latency" in settings:
             self.low_latency_checkbox.setChecked(settings["low_latency"])
+            
+        # Set HDMI settings
+        if hasattr(self, 'display_combo') and "hdmi_display_index" in settings:
+            display_index = settings["hdmi_display_index"]
+            for i in range(self.display_combo.count()):
+                if self.display_combo.itemData(i) == display_index:
+                    self.display_combo.setCurrentIndex(i)
+                    break
+                    
+        if hasattr(self, 'display_mode_combo') and "hdmi_display_mode" in settings:
+            mode_index = self.display_mode_combo.findText(settings["hdmi_display_mode"])
+            if mode_index >= 0:
+                self.display_mode_combo.setCurrentIndex(mode_index)
+                
+        if hasattr(self, 'always_on_top_checkbox') and "hdmi_always_on_top" in settings:
+            self.always_on_top_checkbox.setChecked(settings["hdmi_always_on_top"])
+            
+        if hasattr(self, 'match_display_res_checkbox') and "hdmi_match_resolution" in settings:
+            self.match_display_res_checkbox.setChecked(settings["hdmi_match_resolution"])
 
             
     def load_default_settings(self):
         """Load default settings"""
+        total_displays = len(self.display_manager.get_displays())
+        default_platform = "HDMI Display" if total_displays > 1 else "Custom RTMP"
+        
         return {
-            "platform": "Custom RTMP",
+            "platform": default_platform,
             "url": "",
             "key": "",
             "resolution": "1920x1080",
@@ -615,7 +795,12 @@ class StreamSettingsDialog(QDialog):
             "keyframe_interval": 2,
             "buffer_size": 3,
             "reconnect_attempts": 3,
-            "low_latency": False
+            "low_latency": False,
+            # HDMI-specific defaults
+            "hdmi_display_index": 1 if len(self.display_manager.get_displays()) > 1 else 0,
+            "hdmi_display_mode": "Fullscreen",
+            "hdmi_always_on_top": True,
+            "hdmi_match_resolution": True
         }
         
     def load_saved_settings(self):
@@ -634,14 +819,23 @@ class StreamSettingsDialog(QDialog):
         """Save settings and close dialog"""
         self.settings = self.get_settings()
         
-        # Validate required fields
-        if not self.settings["url"]:
-            self.show_status("Error: Stream URL is required", error=True)
-            return
-            
-        if not self.settings["key"]:
-            self.show_status("Error: Stream key is required", error=True)
-            return
+        # Validate required fields based on platform
+        is_hdmi = self.settings.get("platform") == "HDMI Display"
+        
+        if not is_hdmi:
+            # Validate streaming settings
+            if not self.settings["url"]:
+                self.show_status("Error: Stream URL is required", error=True)
+                return
+                
+            if not self.settings["key"]:
+                self.show_status("Error: Stream key is required", error=True)
+                return
+        else:
+            # Validate HDMI settings
+            if "hdmi_display_index" not in self.settings:
+                self.show_status("Error: Please select a display for HDMI output", error=True)
+                return
         
         # Save to file
         settings_file = Path(__file__).parent / f"{self.stream_name.lower()}_settings.json"
